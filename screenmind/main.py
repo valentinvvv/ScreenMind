@@ -138,7 +138,10 @@ async def main():
             _safe_print("  This is a one-time download of ~2.5 GB (PyTorch + AI models).")
             _safe_print("=" * 60)
             _safe_print()
-            answer = input("  Install now? [Y/n]: ").strip().lower()
+            try:
+                answer = input("  Install now? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""  # no TTY — accept the default (install)
             if answer in ("", "y", "yes"):
                 _safe_print()
                 _safe_print("  Installing AI packages (this may take a few minutes)...")
