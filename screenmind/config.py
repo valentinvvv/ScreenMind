@@ -123,9 +123,21 @@ class Settings(BaseSettings):
     )
 
     # ── Model ────────────────────────────────────────────────────────────
-    gemma_mode: Literal["local", "api"] = Field(
+    gemma_mode: Literal["local", "api", "custom"] = Field(
         default="local",
-        description="'local' for llama-server, 'api' for Google AI Studio (sends data to Google)",
+        description="'local' for llama-server, 'custom' for any OpenAI-compatible endpoint, 'api' for Google AI Studio (sends data to Google)",
+    )
+    llm_api_base_url: str = Field(
+        default="http://localhost:11434/v1",
+        description="Base URL for custom LLM endpoint (gemma_mode=custom). Include the version path, e.g. http://localhost:11434/v1",
+    )
+    llm_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for custom LLM endpoint (leave unset if not required)",
+    )
+    llm_model_name: str = Field(
+        default="gemma4:e2b",
+        description="Model name sent to the custom LLM endpoint (gemma_mode=custom)",
     )
     ollama_model: str = Field(
         default="gemma4:e2b",

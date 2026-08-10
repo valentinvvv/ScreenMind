@@ -307,12 +307,17 @@ class GemmaAnalyzer:
         self._initialized = False
 
     def _ensure_client(self):
-        """Check llama-server is reachable."""
+        """Check the inference backend is reachable."""
         if not self._initialized:
             if llm_client.is_available():
                 self._initialized = True
-                logger.info(f"Connected to llama-server at {settings.llama_server_host}")
+                if settings.gemma_mode == "custom":
+                    logger.info(f"Connected to LLM API at {settings.llm_api_base_url}")
+                else:
+                    logger.info(f"Connected to llama-server at {settings.llama_server_host}")
             else:
+                if settings.gemma_mode == "custom":
+                    raise ConnectionError(f"Cannot reach LLM API at {settings.llm_api_base_url}")
                 raise ConnectionError(f"Cannot reach llama-server at {settings.llama_server_host}")
 
     def analyze_screenshot(
@@ -899,5 +904,5 @@ class GemmaAnalyzer:
         )
 
     def is_available(self) -> bool:
-        """Check if llama-server is reachable."""
+        """Check if the inference backend is reachable."""
         return llm_client.is_available()

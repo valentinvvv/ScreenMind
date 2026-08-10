@@ -70,7 +70,7 @@ async def reanalyze_activity(activity_id: int):
     """Re-run Gemma analysis + layout detection on a single activity."""
     conn = db._get_conn()
     row = conn.execute(
-        "SELECT screenshot_path, ocr_text, ocr_boxes, detected_app_name, window_title FROM activities WHERE id = ?",
+        "SELECT screenshot_path, ocr_text, ocr_boxes, detected_app, window_title FROM activities WHERE id = ?",
         (activity_id,),
     ).fetchone()
     if not row:

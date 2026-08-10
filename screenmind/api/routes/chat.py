@@ -458,22 +458,24 @@ async def chat_with_memory(request: Request):
         if _llm.is_inference_active():
             _llm.cancel_current_inference()
             yield send_progress("⏳ Waiting for GPU...")
-            # Poll llama-server /slots until the slot is free (or timeout)
-            import httpx as _httpx
-            _slot_free = False
-            for _wait_i in range(20):  # 20 × 0.5s = 10s max
-                await asyncio.sleep(0.5)
-                try:
-                    _sr = _httpx.get(f"{_llm._base_url()}/slots", timeout=2)
-                    if _sr.status_code == 200:
-                        _slots = _sr.json()
-                        if isinstance(_slots, list) and all(not s.get("is_processing") for s in _slots):
-                            _slot_free = True
-                            break
-                except Exception:
-                    pass
-            if not _slot_free:
-                logger.info("GPU slot still busy after 10s — proceeding anyway")
+            # Poll llama-server /slots until the slot is free (or timeout).
+            # /slots is llama.cpp-specific — skip on custom OpenAI-compatible endpoints.
+            if not _llm._is_custom_backend():
+                import httpx as _httpx
+                _slot_free = False
+                for _wait_i in range(20):  # 20 × 0.5s = 10s max
+                    await asyncio.sleep(0.5)
+                    try:
+                        _sr = _httpx.get(f"{_llm._base_url()}/slots", timeout=2)
+                        if _sr.status_code == 200:
+                            _slots = _sr.json()
+                            if isinstance(_slots, list) and all(not s.get("is_processing") for s in _slots):
+                                _slot_free = True
+                                break
+                    except Exception:
+                        pass
+                if not _slot_free:
+                    logger.info("GPU slot still busy after 10s — proceeding anyway")
 
         logger.debug(f"Mode: {'vision' if timeline_context == 'vision' else 'text' if timeline_context else 'chat'} | Messages: {len(messages)}")
 

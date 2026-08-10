@@ -246,3 +246,91 @@ class TestHealthCheck:
         mock_get.return_value = MagicMock(status_code=503)
         status = get_server_status()
         assert status["status"] == "error"
+
+
+class TestCustomBackend:
+    """Tests for gemma_mode=custom (user-supplied OpenAI-compatible endpoint)."""
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_uses_custom_url_model_and_auth(self, mock_client_cls, mock_settings):
+        """Custom mode: /chat/completions (no /v1), model in payload, Bearer key."""
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://api.test/v1/"
+        mock_settings.llm_api_key = "sk-test"
+        mock_settings.llm_model_name = "test-model"
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+
+        chat([{"role": "user", "content": "hi"}])
+
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://api.test/v1/chat/completions"
+        assert call_args[1]["json"]["model"] == "test-model"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-test"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_custom_no_key_sends_no_auth(self, mock_client_cls, mock_settings):
+        """Custom mode without API key sends empty headers (local Ollama, vLLM)."""
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://localhost:11434/v1"
+        mock_settings.llm_api_key = None
+        mock_settings.llm_model_name = "gemma4:e2b"
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+
+        chat([{"role": "user", "content": "hi"}])
+
+        assert mock_client_cls.return_value.post.call_args[1]["headers"] == {}
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_local_mode_unchanged(self, mock_client_cls):
+        """Local mode keeps /v1/chat/completions and omits the model field."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+
+        chat([{"role": "user", "content": "hi"}])
+
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0].endswith("/v1/chat/completions")
+        assert "model" not in call_args[1]["json"]
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_is_available_probes_models_endpoint(self, mock_get, mock_settings):
+        """Custom mode health check hits /models with auth header."""
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://api.test/v1"
+        mock_settings.llm_api_key = "sk-test"
+        mock_get.return_value = MagicMock(status_code=200)
+
+        assert is_available() is True
+        call_args = mock_get.call_args
+        assert call_args[0][0] == "http://api.test/v1/models"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-test"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    def test_transcribe_audio_rejected_on_custom(self, mock_settings):
+        """Audio input is not supported by generic OpenAI-compatible endpoints."""
+        mock_settings.gemma_mode = "custom"
+        with pytest.raises(ValueError, match="not supported with custom"):
+            transcribe_audio(b"fake wav bytes")
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_server_status_unreachable_mentions_api(self, mock_get, mock_settings):
+        """Unreachable custom endpoint reports 'LLM API endpoint' in detail."""
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://api.test/v1"
+        mock_settings.llm_api_key = None
+        mock_get.side_effect = httpx.ConnectError("refused")
+        status = get_server_status()
+        assert status["status"] == "unreachable"
+        assert "LLM API endpoint" in status["detail"]

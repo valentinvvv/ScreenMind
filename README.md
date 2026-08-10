@@ -76,7 +76,7 @@
 
 ### 🔒 Privacy & Security
 
-- **100% Local** — All data stays on your machine. Zero network calls after initial model download. No telemetry. Ever.
+- **100% Local** — All data stays on your machine. Zero network calls after initial model download. No telemetry. Ever. (Exception: `GEMMA_MODE=api` or `custom` sends screenshots to the configured external endpoint.)
 - **Sensitive Data Filter** — Auto-redacts credit cards, SSNs, API keys, passwords before storage.
 - **Encryption at Rest** — AES encryption for screenshots (Fernet + OS keyring).
 - **Dashboard PIN Lock** — Session-based auth with configurable auto-lock timeout.
@@ -509,6 +509,10 @@ All settings configurable via `.env`, environment variables, or the **Settings**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CAPTURE_INTERVAL` | `40` | Seconds between captures |
+| `GEMMA_MODE` | `local` | `local` (llama-server), `custom` (OpenAI-compatible endpoint), or `api` (Google AI Studio) |
+| `LLM_API_BASE_URL` | `http://localhost:11434/v1` | Endpoint for `GEMMA_MODE=custom` (Ollama, vLLM, LM Studio, cloud, ...) |
+| `LLM_API_KEY` | *(unset)* | API key for the custom endpoint (leave unset if not required) |
+| `LLM_MODEL_NAME` | `gemma4:e2b` | Model name sent to the custom endpoint |
 | `ANALYSIS_MODE` | `fast` | `fast` (~12s), `balanced` (~40s), or `merged` (~76s, accurate) |
 | `PERFORMANCE_MODE` | `balanced` | GPU layers: `minimal` / `balanced` / `maximum` |
 | `BLOCKED_APPS` | *(empty)* | Comma-separated apps to never capture |

@@ -30,19 +30,23 @@ logger = logging.getLogger("screenmind.main")
 
 
 def check_llama_server() -> bool:
-    """Check if llama-server is reachable and ready for inference."""
+    """Check if the inference backend is reachable and ready."""
     from screenmind.engine import llm_client
 
+    custom = settings.gemma_mode == "custom"
     status = llm_client.get_server_status()
     if status["status"] == "ok":
-        logger.info(f"OK - llama-server online at {settings.llama_server_host}")
+        target = settings.llm_api_base_url if custom else settings.llama_server_host
+        logger.info(f"OK - {'LLM API' if custom else 'llama-server'} online at {target}")
         return True
     elif status["status"] == "unreachable":
-        logger.error(f"FAIL - Cannot reach llama-server at {settings.llama_server_host}")
-        logger.info(f"Start it with: llama-server -hf ggml-org/gemma-4-E2B-it-GGUF:gemma-4-E2B-it-Q4_0 --mmproj-auto -ngl 99 --port {settings.llama_server_port}")
+        target = settings.llm_api_base_url if custom else settings.llama_server_host
+        logger.error(f"FAIL - Cannot reach {'LLM API' if custom else 'llama-server'} at {target}")
+        if not custom:
+            logger.info(f"Start it with: llama-server -hf ggml-org/gemma-4-E2B-it-GGUF:gemma-4-E2B-it-Q4_0 --mmproj-auto -ngl 99 --port {settings.llama_server_port}")
         return False
     else:
-        logger.info(f"WARN - llama-server issue: {status['detail']}")
+        logger.info(f"WARN - {'LLM API' if custom else 'llama-server'} issue: {status['detail']}")
         return False
 
 
@@ -171,36 +175,58 @@ async def main():
         _safe_print("   This disables the local-only privacy guarantee.")
         _safe_print("   Set GEMMA_MODE=local to keep all data on your machine.")
         _safe_print("=" * 70)
+    elif settings.gemma_mode == "custom":
+        _safe_print("")
+        _safe_print("=" * 70)
+        _safe_print(f"Custom LLM endpoint: {settings.llm_api_base_url} (model: {settings.llm_model_name})")
+        _safe_print("   Screenshots are sent to this endpoint for analysis.")
+        _safe_print("   Set GEMMA_MODE=local to keep all data on your machine.")
+        _safe_print("=" * 70)
     _safe_print()
 
-    # ── llama-server setup ─────────────────────────────────────────────
-    # Check if llama-server binary is available; offer to install if missing
-    from screenmind.setup_llama import ensure_llama_server
-    llama_binary_available = ensure_llama_server()
-
-    # ── Health checks ────────────────────────────────────────────────
+    # ── Inference backend setup ────────────────────────────────────────
     from screenmind.engine import model_manager
-    if llama_binary_available:
-        # Binary exists — check if server is running, start if not
-        if not check_llama_server():
-            logger.info("llama-server not running — starting automatically...")
-            llm_server_ok = model_manager.start_server(settings.active_model, timeout=120)
-        else:
-            llm_server_ok = True
-            # Detect what model the external server has loaded
-            detection = model_manager.detect_running_model()
-            if detection:
-                model_manager.adopt_external_server(detection)
+    if settings.gemma_mode == "custom":
+        # User-supplied OpenAI-compatible endpoint — no local server management
+        llm_server_ok = check_llama_server()
+        if not llm_server_ok:
+            logger.warning("Custom LLM endpoint unreachable — screenshots will be captured")
+            logger.warning("but NOT analyzed until the endpoint is available.")
     else:
-        llm_server_ok = False
+        # Check if llama-server binary is available; offer to install if missing
+        from screenmind.setup_llama import ensure_llama_server
+        llama_binary_available = ensure_llama_server()
+
+        # ── Health checks ────────────────────────────────────────────────
+        if llama_binary_available:
+            # Binary exists — check if server is running, start if not
+            if not check_llama_server():
+                logger.info("llama-server not running — starting automatically...")
+                llm_server_ok = model_manager.start_server(settings.active_model, timeout=120)
+            else:
+                llm_server_ok = True
+                # Detect what model the external server has loaded
+                detection = model_manager.detect_running_model()
+                if detection:
+                    model_manager.adopt_external_server(detection)
+        else:
+            llm_server_ok = False
 
     check_disk_space()
     if not llm_server_ok:
         _safe_print()
-        logger.warning("Starting without Gemma 4 -- screenshots will be captured")
-        logger.warning("but NOT analyzed until llama-server is available.")
+        logger.warning("Starting without an LLM backend -- screenshots will be captured")
+        logger.warning("but NOT analyzed until the backend is available.")
         logger.warning("The dashboard and API will still work with existing data.")
-        if not llama_binary_available:
+        if settings.gemma_mode == "custom":
+            _safe_print("=" * 70)
+            _safe_print("WARNING: LLM API endpoint unreachable!")
+            _safe_print(f"   Base URL: {settings.llm_api_base_url}")
+            _safe_print(f"   Model: {settings.llm_model_name}")
+            _safe_print("   Set LLM_API_BASE_URL, LLM_API_KEY (if required), and LLM_MODEL_NAME")
+            _safe_print("   in your .env file or environment variables.")
+            _safe_print("=" * 70)
+        elif not llama_binary_available:
             logger.info("Run 'python -m screenmind.setup_llama' to install llama-server.")
         _safe_print()
     _safe_print()
