@@ -288,8 +288,18 @@ class Settings(BaseSettings):
     # ── Internal State ────────────────────────────────────────────────────
     setup_complete: bool = Field(default=False, description="Whether first-run setup is complete")
 
+    # .env lookup order (later file wins): data-dir .env first (stable across
+    # reinstalls — the installed app's primary config location), then CWD .env
+    # (dev override). Real environment variables always win over both.
     model_config = {
-        "env_file": ".env",
+        "env_file": (
+            str(Path(os.path.expanduser(
+                os.environ.get("SCREENMIND_DATA_DIR")
+                or os.environ.get("DATA_DIR")
+                or "~/.screenmind"
+            )) / ".env"),
+            ".env",
+        ),
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
         "validate_assignment": True,
