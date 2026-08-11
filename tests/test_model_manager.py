@@ -6,7 +6,7 @@
   - switch_model guards (downloaded check, variant fallback, single-flight lock)
   - cancel_download flag under lock
   - _check_model_disk_space for all models + variant-specific sizes
-  - get_model_status capabilities field
+  - get_model_status capabilities field + custom mode (gemma_mode=custom)
   - delete_variant / delete_model guards and behavior
 """
 
@@ -391,6 +391,74 @@ class TestGetModelStatus:
         with patch.object(model_manager, "is_model_downloaded", return_value=False):
             status = model_manager.get_model_status()
             assert status["status"] == "no_model"
+
+    @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_custom_mode_ready_when_endpoint_reachable(self, _):
+        """Custom mode reports ready without any local model/server."""
+        model_manager._set_download_state(active=False, status="idle")
+        status = model_manager.get_model_status()
+        assert status["status"] == "ready"
+        assert status["backend"] == "custom"
+        assert status["model_downloaded"] is True
+        assert status["capabilities"]["audio"] is False
+
+    @patch.object(model_manager, "_probe_custom_endpoint", return_value=False)
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_custom_mode_error_when_endpoint_unreachable(self, _):
+        """Custom mode reports error with a message when endpoint is down."""
+        model_manager._set_download_state(active=False, status="idle")
+        status = model_manager.get_model_status()
+        assert status["status"] == "error"
+        assert status["backend"] == "custom"
+        assert "message" in status and status["message"]
+
+    @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_custom_mode_ignores_download_state(self, _):
+        """Custom mode never reports local download/lifecycle states."""
+        model_manager._set_download_state(
+            active=True, status="downloading", model="gemma-4-e2b",
+            downloaded_bytes=123, message="Downloading...",
+        )
+        try:
+            status = model_manager.get_model_status()
+            assert status["status"] == "ready"
+        finally:
+            model_manager._set_download_state(
+                active=False, status="idle", model=None,
+                downloaded_bytes=0, message="",
+            )
+
+    def test_probe_cache_within_ttl(self):
+        """Repeated probes within TTL don't re-hit the endpoint."""
+        model_manager._custom_probe = {"ts": 0.0, "ok": False}
+        with patch("screenmind.engine.llm_client.get_server_status",
+                   return_value={"status": "ok"}) as mock_status:
+            assert model_manager._probe_custom_endpoint() is True
+            assert model_manager._probe_custom_endpoint() is True
+            assert mock_status.call_count == 1
+
+    def test_probe_force_bypasses_cache(self):
+        """force=True re-probes even when cache is fresh."""
+        import time as _time
+        model_manager._custom_probe = {"ts": _time.time(), "ok": True}
+        with patch("screenmind.engine.llm_client.get_server_status",
+                   return_value={"status": "unreachable"}):
+            assert model_manager._probe_custom_endpoint(force=True) is False
+
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_is_backend_available_uses_probe_in_custom_mode(self):
+        """is_backend_available checks the endpoint, not a local process."""
+        with patch.object(model_manager, "_probe_custom_endpoint", return_value=True) as p:
+            assert model_manager.is_backend_available() is True
+            p.assert_called_once()
+
+    @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_restart_server_reprobes_in_custom_mode(self, _probe):
+        """Retry in custom mode re-probes the endpoint instead of spawning llama-server."""
+        assert model_manager.restart_server() is True
 
 
 # ── Delete Variant / Model ────────────────────────────────────────────

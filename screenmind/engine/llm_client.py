@@ -269,14 +269,14 @@ def is_available() -> bool:
         return False
 
 
-def get_server_status() -> dict:
+def get_server_status(timeout: float = HEALTH_TIMEOUT) -> dict:
     """Get detailed server status."""
     try:
         if _is_custom_backend():
             url = f"{_base_url()}/models"
         else:
             url = f"{_base_url()}/health"
-        response = httpx.get(url, timeout=HEALTH_TIMEOUT, headers=_auth_headers())
+        response = httpx.get(url, timeout=timeout, headers=_auth_headers())
         if response.status_code == 200:
             return {"status": "ok", "detail": response.json() if response.text else {}}
         return {"status": "error", "detail": f"HTTP {response.status_code}"}

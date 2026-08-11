@@ -555,9 +555,9 @@ class AgentScheduler:
                 continue
 
             try:
-                # Don't run agents if no model server is available (#10)
+                # Don't run agents if no model backend is available (#10)
                 from screenmind.engine import model_manager
-                if not model_manager.is_server_running():
+                if not model_manager.is_backend_available():
                     time.sleep(60)
                     continue
 

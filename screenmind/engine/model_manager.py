@@ -683,6 +683,11 @@ def restart_server() -> bool:
     and prevents concurrent retries from racing each other.
     Sets transient 'starting' state so UI shows "Booting up..." instead of "error".
     """
+    if settings.gemma_mode == "custom":
+        # No local server to restart — "retry" just re-probes the endpoint.
+        _clear_error_state()
+        return _probe_custom_endpoint(force=True)
+
     if not _download_lock.acquire(blocking=False):
         logger.warning("Lifecycle in progress, retry ignored")
         return False
@@ -711,7 +716,7 @@ def get_active_model() -> Optional[str]:
 
 
 def is_server_running() -> bool:
-    """Check if llama-server process is alive (internal or external)."""
+    """Check if llama-server process is alive (internal or external). Local mode only."""
     if _server_process is not None and _server_process.poll() is None:
         return True
     if _external_server:
@@ -725,6 +730,63 @@ def is_server_running() -> bool:
     return False
 
 
+# ── Custom endpoint (gemma_mode=custom) ───────────────────────────────
+
+# Probe cache — /api/status polls every 5-15s; don't hit the network each time
+_custom_probe: dict = {"ts": 0.0, "ok": False}
+_CUSTOM_PROBE_TTL = 10.0  # seconds
+
+
+def _probe_custom_endpoint(force: bool = False) -> bool:
+    """
+    Check whether the configured OpenAI-compatible endpoint is reachable.
+
+    Result is cached for _CUSTOM_PROBE_TTL seconds so status polling doesn't
+    hammer the endpoint (or block the API when it's down).
+    """
+    global _custom_probe
+    now = time.time()
+    if not force and now - _custom_probe["ts"] < _CUSTOM_PROBE_TTL:
+        return _custom_probe["ok"]
+    from screenmind.engine import llm_client
+    ok = llm_client.get_server_status(timeout=3.0)["status"] == "ok"
+    _custom_probe = {"ts": now, "ok": ok}
+    return ok
+
+
+def is_backend_available() -> bool:
+    """
+    True when the inference backend is usable: llama-server process alive in
+    local mode, configured endpoint reachable in custom mode.
+    """
+    if settings.gemma_mode == "custom":
+        return _probe_custom_endpoint()
+    return is_server_running()
+
+
+def _custom_endpoint_status() -> dict:
+    """Model status payload for gemma_mode=custom — no local lifecycle to track."""
+    base = {
+        "active_model": settings.llm_model_name,
+        "model_downloaded": True,
+        "backend": "custom",
+        # Audio input is rejected by llm_client in custom mode; vision is
+        # assumed available (analysis sends images to the endpoint).
+        "capabilities": {"audio": False, "vision": True},
+        "download": None,
+    }
+    if _probe_custom_endpoint():
+        return {"status": "ready", **base}
+    return {
+        "status": "error",
+        **base,
+        "message": (
+            f"Cannot reach LLM endpoint at {settings.llm_api_base_url}. "
+            "Check that the server is running and the Base URL in Settings is correct."
+        ),
+    }
+
+
 def get_model_status() -> dict:
     """
     Get the full model status for the frontend.
@@ -734,7 +796,13 @@ def get_model_status() -> dict:
       active_model: str | None
       capabilities: {audio: bool, vision: bool}
       download: dict | None  (download state if active)
+
+    In custom mode (gemma_mode=custom) there is no local server lifecycle —
+    status reflects reachability of the configured endpoint instead.
     """
+    if settings.gemma_mode == "custom":
+        return _custom_endpoint_status()
+
     dl = get_download_state()
     active = get_active_model() or settings.active_model
     caps = get_active_capabilities()
