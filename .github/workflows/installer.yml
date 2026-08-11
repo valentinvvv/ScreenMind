@@ -1,0 +1,87 @@
+name: Build Windows installer
+
+# Builds the self-contained Windows installer (embedded Python + Inno Setup).
+# On version-tag pushes the installer is attached to the GitHub release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read package version
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path screenmind/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"'
+          $version = $m.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building installer for version $version"
+
+      - name: Download embeddable Python 3.10
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip" -OutFile py-embed.zip
+          Expand-Archive py-embed.zip -DestinationPath installer/runtime
+          Remove-Item py-embed.zip
+
+      - name: Enable site-packages in embedded runtime
+        shell: pwsh
+        run: |
+          Set-Content -Path installer/runtime/python310._pth -Value @("python310.zip", ".", "Lib\site-packages", "", "import site")
+
+      - name: Bootstrap pip and install ScreenMind + core deps
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile installer/runtime/get-pip.py
+          installer/runtime/python.exe installer/runtime/get-pip.py --no-warn-script-location
+          Remove-Item installer/runtime/get-pip.py
+          # Installs screenmind and every core dependency from pyproject.toml
+          # ([windows] extra adds uiautomation). pip stays in the runtime so the
+          # app's first-run flow can install the optional AI stack (~2.5 GB).
+          installer/runtime/python.exe -m pip install --no-warn-script-location ".[windows]"
+
+      - name: Clean bytecode caches
+        shell: pwsh
+        run: |
+          Get-ChildItem installer/runtime/Lib/site-packages -Directory -Recurse -Filter __pycache__ |
+            Remove-Item -Recurse -Force
+
+      - name: Locate Inno Setup compiler
+        id: iscc
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found — install Inno Setup 6" }
+          "path=$iscc" >> $env:GITHUB_OUTPUT
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & "${{ steps.iscc.outputs.path }}" /DMyAppVersion=${{ steps.ver.outputs.version }} installer/installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenMind-${{ steps.ver.outputs.version }}-setup-win64
+          path: dist/ScreenMind-${{ steps.ver.outputs.version }}-setup-win64.exe
+
+      - name: Attach installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ScreenMind-${{ steps.ver.outputs.version }}-setup-win64.exe
