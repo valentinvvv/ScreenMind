@@ -10,6 +10,17 @@ import pytest
 from screenmind.config import settings
 
 
+@pytest.fixture(autouse=True)
+def _pin_local_backend():
+    """Tests assume the default local backend. The developer's real
+    ~/.screenmind/settings.json may set gemma_mode=custom — don't let it
+    leak into tests that exercise local-mode behavior."""
+    original = settings.gemma_mode
+    settings.gemma_mode = "local"
+    yield
+    settings.gemma_mode = original
+
+
 @pytest.fixture
 def tmp_data_dir(tmp_path):
     """Provide a temporary data directory for tests."""

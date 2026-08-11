@@ -50,6 +50,11 @@ _URL_NOISE = {'http://localhost', 'http://127.0.0.1', 'https://fonts.googleapis.
               'https://cdn.', 'http://schemas.', 'chrome-extension://'}
 
 
+def _is_failure_summary(summary: Optional[str]) -> bool:
+    """True when a summary is an analysis-failure placeholder, not real content."""
+    return bool(summary) and summary.startswith("Analysis failed")
+
+
 def _extract_url(text: str) -> str | None:
     """Extract the most likely active-page URL from OCR/A11y text.
 
@@ -115,6 +120,10 @@ class AnalysisWorker:
         # Priority re-queue: items cancelled by chat pre-emption go here
         # and are processed BEFORE new queue items (front-of-queue behavior)
         self._priority_items: deque = deque()
+
+        # Backfill cooldown: activity_id -> time of last failed attempt.
+        # Prevents hammering the same row every 2s when analysis keeps failing.
+        self._backfill_cooldown: dict = {}
 
     def _ensure_embedder(self):
         """Lazy-load the embedding model."""
@@ -256,6 +265,9 @@ class AnalysisWorker:
             #    Compare pHash against last analyzed frame for same (app, title).
             cache_key = (capture.app_name or "unknown", (capture.window_title or "")[:100])
             cached = self._app_cache.get(cache_key)
+            # Never reuse a cached failure placeholder — force a real re-analysis
+            if cached and _is_failure_summary(cached["analysis"].activity_summary):
+                cached = None
             tier = "full"  # default: full Gemma call
 
             if cached and capture.phash and not capture.bookmarked:
@@ -547,8 +559,10 @@ class AnalysisWorker:
                 active_url=active_url,
             )
 
-            # 7. Update per-app cache (for both "full" and "minor" tiers)
-            if capture.phash:
+            # 7. Update per-app cache (for both "full" and "minor" tiers).
+            #    Failure placeholders are never cached — identical/minor tiers
+            #    would otherwise copy "Analysis failed" forward forever.
+            if capture.phash and not _is_failure_summary(analysis.activity_summary):
                 self._app_cache[cache_key] = {
                     "phash": capture.phash,
                     "analysis": analysis,
@@ -644,19 +658,31 @@ class AnalysisWorker:
         Catches: entries from crashes (analyzed=0) + stale skips.
         """
         try:
+            activity_id = None
             conn = self._db._get_conn()
-            row = conn.execute(
+            rows = conn.execute(
                 """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes
                    FROM activities
                    WHERE (analyzed = 0
                       OR summary = 'Skipped (analysis backlog)'
                       OR summary LIKE 'Analysis failed%')
                      AND DATE(timestamp) = DATE('now', 'localtime')
-                   ORDER BY timestamp DESC LIMIT 1""",
-            ).fetchone()
+                   ORDER BY timestamp DESC LIMIT 20""",
+            ).fetchall()
+
+            # Skip rows whose last backfill attempt failed recently (10 min
+            # cooldown) — otherwise a permanently-failing row is retried
+            # every 2s and blocks the rest of the backlog.
+            now = time.time()
+            row = None
+            for candidate in rows:
+                last_fail = self._backfill_cooldown.get(candidate[0])
+                if last_fail is None or now - last_fail >= 600:
+                    row = candidate
+                    break
 
             if not row:
-                return  # No skipped entries — nothing to backfill
+                return  # Nothing to backfill (or everything is cooling down)
 
             activity_id, ss_path, window_title, app_name, ocr_text, ocr_boxes_raw = row
 
@@ -711,9 +737,26 @@ class AnalysisWorker:
                 await self._process(capture)
             finally:
                 self._is_backfill = False
+
+            # Still a failure placeholder? Back off instead of looping.
+            new_summary = conn.execute(
+                "SELECT summary FROM activities WHERE id = ?", (activity_id,)
+            ).fetchone()
+            if new_summary and _is_failure_summary(new_summary[0]):
+                self._backfill_cooldown[activity_id] = time.time()
+                if len(self._backfill_cooldown) > 500:
+                    cutoff = time.time() - 3600
+                    self._backfill_cooldown = {
+                        k: v for k, v in self._backfill_cooldown.items() if v > cutoff
+                    }
+                logger.warning(f"Backfill #{activity_id} failed again — next retry in 10 min")
+                return
+            self._backfill_cooldown.pop(activity_id, None)
             logger.info(f"Backfill #{activity_id} complete")
 
         except Exception as e:
+            if activity_id is not None:
+                self._backfill_cooldown[activity_id] = time.time()
             logger.error(f"Backfill error: {e}")
 
     def stop(self):
