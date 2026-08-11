@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime
+from unittest.mock import patch
 
 from screenmind.storage.models import ScreenshotEntry, ActivityRecord
 import screenmind.api.dependencies as deps
@@ -89,6 +90,27 @@ async def test_settings_get(client):
     assert "capture_interval" in data
     assert "performance_mode" in data
 
+
+@pytest.mark.asyncio
+async def test_llm_test_endpoint_ok(client):
+    """/api/llm/test returns discovered models from a reachable endpoint."""
+    with patch("screenmind.engine.llm_client.list_remote_models", return_value=["model-a", "model-b"]):
+        resp = await client.post("/api/llm/test", json={"base_url": "http://api.test/v1"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["models"] == ["model-a", "model-b"]
+
+
+@pytest.mark.asyncio
+async def test_llm_test_endpoint_failure(client):
+    """/api/llm/test reports errors without raising."""
+    with patch("screenmind.engine.llm_client.list_remote_models", side_effect=Exception("refused")):
+        resp = await client.post("/api/llm/test", json={"base_url": "http://down.test/v1"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert "refused" in data["error"]
 
 @pytest.mark.asyncio
 async def test_capture_pause_resume(client):

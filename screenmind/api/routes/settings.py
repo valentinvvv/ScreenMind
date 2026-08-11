@@ -26,6 +26,10 @@ async def get_settings():
         "meeting_apps": settings.meeting_apps,
         "retention_days": settings.retention_days,
         "ollama_model": settings.ollama_model,
+        "gemma_mode": settings.gemma_mode,
+        "llm_api_base_url": settings.llm_api_base_url,
+        "llm_api_key_set": bool(settings.llm_api_key),
+        "llm_model_name": settings.llm_model_name,
         "obsidian_enabled": settings.obsidian_enabled,
         "obsidian_vault_path": settings.obsidian_vault_path,
         "notion_enabled": settings.notion_enabled,
@@ -75,6 +79,10 @@ async def update_settings(request: Request):
         "meeting_apps": settings.meeting_apps,
         "retention_days": settings.retention_days,
         "ollama_model": settings.ollama_model,
+        "gemma_mode": settings.gemma_mode,
+        "llm_api_base_url": settings.llm_api_base_url,
+        "llm_api_key_set": bool(settings.llm_api_key),
+        "llm_model_name": settings.llm_model_name,
         "obsidian_enabled": settings.obsidian_enabled,
         "obsidian_vault_path": settings.obsidian_vault_path,
         "notion_enabled": settings.notion_enabled,
@@ -102,6 +110,34 @@ async def update_settings(request: Request):
         "voice_hotkey": settings.voice_hotkey,
         "capture_active_monitor": settings.capture_active_monitor,
     }
+
+
+@router.post("/llm/test")
+async def test_llm_endpoint(request: Request):
+    """Probe an OpenAI-compatible endpoint and list its models.
+
+    Body: {"base_url": ..., "api_key": ...} — both optional, defaults to the
+    configured values. Returns {"ok": True, "models": [...]} on success.
+    """
+    import asyncio
+    from screenmind.engine import llm_client
+
+    body = await request.json()
+    base_url = (body.get("base_url") or settings.llm_api_base_url).strip()
+    api_key = body.get("api_key")
+    if api_key == "":
+        api_key = None  # empty field → fall back to the configured key
+
+    try:
+        models = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: llm_client.list_remote_models(base_url, api_key)
+            ),
+            timeout=10,
+        )
+        return {"ok": True, "base_url": base_url, "models": models}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
 @router.post("/integrations/test")

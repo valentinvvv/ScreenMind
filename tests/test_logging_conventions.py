@@ -10,7 +10,8 @@ def _source_files():
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in (
-            '__pycache__', '.git', 'node_modules', 'venv', 'tests', '.agents',
+            '__pycache__', '.git', 'node_modules', 'venv', '.venv', 'tests', '.agents',
+            'dist', 'dist_build', 'build', '.eggs',
         )]
         for fn in files:
             if not fn.endswith('.py'):

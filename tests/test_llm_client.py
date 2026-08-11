@@ -7,7 +7,7 @@ import httpx
 from screenmind.engine.llm_client import (
     InferenceCancelled, cancel_current_inference, is_inference_active,
     chat, chat_with_images, transcribe_audio, generate, is_available,
-    get_server_status, _cancel_event, _client_lock,
+    get_server_status, list_remote_models, _cancel_event, _client_lock,
 )
 
 
@@ -334,3 +334,62 @@ class TestCustomBackend:
         status = get_server_status()
         assert status["status"] == "unreachable"
         assert "LLM API endpoint" in status["detail"]
+
+
+class TestListRemoteModels:
+    """Tests for list_remote_models() — GET /models model discovery."""
+
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_returns_sorted_ids(self, mock_get):
+        """Model ids are extracted from OpenAI /models response and sorted."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": [
+            {"id": "zeta-model"}, {"id": "alpha-model"}, {"id": "mid-model"},
+        ]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        models = list_remote_models("http://api.test/v1", None)
+        assert models == ["alpha-model", "mid-model", "zeta-model"]
+        assert mock_get.call_args[0][0] == "http://api.test/v1/models"
+
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_sends_bearer_key(self, mock_get):
+        """API key is sent as Bearer auth when provided."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        list_remote_models("http://api.test/v1/", "sk-test")
+        assert mock_get.call_args[1]["headers"] == {"Authorization": "Bearer sk-test"}
+
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_strips_trailing_slash(self, mock_get):
+        """Trailing slash on base URL doesn't produce //models."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        list_remote_models("http://api.test/v1/", None)
+        assert mock_get.call_args[0][0] == "http://api.test/v1/models"
+
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_skips_malformed_entries(self, mock_get):
+        """Entries without a string id are ignored, not crashed on."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"data": [
+            {"id": "good"}, {"name": "no-id"}, "not-a-dict", {"id": 42},
+        ]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        assert list_remote_models("http://api.test/v1", None) == ["good"]
+
+    @patch("screenmind.engine.llm_client.httpx.get")
+    def test_raises_on_http_error(self, mock_get):
+        """HTTP errors propagate so the caller can report them."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=MagicMock()
+        )
+        mock_get.return_value = mock_resp
+        with pytest.raises(httpx.HTTPStatusError):
+            list_remote_models("http://api.test/v1", "bad-key")

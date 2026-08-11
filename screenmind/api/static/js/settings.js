@@ -60,6 +60,20 @@ async function renderSettings(el) {
 
   // ── AI & MODELS ──
   + _sec('&#129504;', 'AI &amp; Models')
+  + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">LLM Backend</div><div class="settings-desc">Where analysis and chat inference runs</div></div></div>'
+  + '<div class="radio-group" id="llm-backend-group">' + _rp('gemma_mode','local','\ud83d\udda5\ufe0f Local (llama-server)',cfg.gemma_mode) + _rp('gemma_mode','custom','\ud83c\udf10 Custom endpoint (OpenAI-compatible)',cfg.gemma_mode) + '</div>'
+  + '<div id="llm-custom-fields" style="display:' + (cfg.gemma_mode === 'custom' ? 'block' : 'none') + ';margin-top:12px">'
+  + '<div class="settings-input-row"><label class="settings-label">Base URL:</label>'
+  + '<input type="text" id="llm-base-url" class="settings-text-input" value="' + (cfg.llm_api_base_url || '') + '" placeholder="http://localhost:11434/v1"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">API Key:</label>'
+  + '<input type="password" id="llm-api-key" class="settings-text-input" value="" placeholder="' + (cfg.llm_api_key_set ? '(unchanged \u2014 key is set)' : 'leave empty if not required') + '"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Model:</label>'
+  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="llm-model-name" class="settings-text-input" style="flex:1" value="' + (cfg.llm_model_name || '') + '" placeholder="gemma4:e2b">'
+  + '<button class="btn btn-sm" onclick="testLLM()">Fetch models from server</button></div></div>'
+  + '<div id="llm-model-list" style="display:none;margin-top:6px"><select id="llm-model-select" class="settings-text-input" style="width:100%"></select></div>'
+  + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testLLM()">Test Connection</button><span id="llm-test-result" style="font-size:0.8rem"></span></div>'
+  + '</div>'
+  + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription is unavailable in custom mode. <strong>Backend changes require a restart.</strong></div></div>'
   + '<div class="settings-card settings-card-accent" id="model-card"><div class="settings-card-header"><div><div class="settings-title">AI Model</div><div class="settings-desc">Select which Gemma model for analysis and chat</div></div></div>'
   + '<div id="model-list" class="model-list"><div class="spinner" style="margin:12px auto"></div></div></div>'
 
@@ -207,6 +221,21 @@ async function renderSettings(el) {
       radio.closest('.radio-pill').classList.add('active');
     });
   });
+  // LLM Backend radio → show/hide custom endpoint fields
+  el.querySelectorAll('input[name="gemma_mode"]').forEach(function(radio) {
+    radio.addEventListener('change', function() {
+      var fields = document.getElementById('llm-custom-fields');
+      if (fields) fields.style.display = (radio.value === 'custom' && radio.checked) ? 'block' : 'none';
+    });
+  });
+  // Remote model dropdown → populate the model name input
+  var llmModelSelect = document.getElementById('llm-model-select');
+  if (llmModelSelect) {
+    llmModelSelect.addEventListener('change', function() {
+      var nameInput = document.getElementById('llm-model-name');
+      if (nameInput && llmModelSelect.value) nameInput.value = llmModelSelect.value;
+    });
+  }
   el.querySelectorAll('#retention-group input').forEach(function(radio) {
     radio.addEventListener('change', updateStorageEstimate);
   });
@@ -485,6 +514,11 @@ window.saveSettings = async function() {
     meeting_transcription: document.getElementById('meeting-toggle').checked,
     meeting_apps: document.getElementById('meeting-apps-input').value,
     retention_days: retention ? parseInt(retention.value) : 7,
+    // LLM Backend
+    gemma_mode: (document.querySelector('input[name="gemma_mode"]:checked') || {}).value || 'local',
+    llm_api_base_url: (document.getElementById('llm-base-url') || {}).value || '',
+    llm_api_key: (document.getElementById('llm-api-key') || {}).value || undefined,
+    llm_model_name: (document.getElementById('llm-model-name') || {}).value || '',
     // Integrations
     obsidian_enabled: (document.getElementById('obsidian-enabled') || {}).checked || false,
     obsidian_vault_path: (document.getElementById('obsidian-vault-path') || {}).value || '',
@@ -553,6 +587,45 @@ window.removePIN = async function() {
   if (r.ok) { showToast('PIN removed', 'success'); navigate('settings'); }
   else { showToast(r.error || 'Current PIN incorrect', 'warning'); }
 };
+window.testLLM = async function() {
+  var resultEl = document.getElementById('llm-test-result');
+  var listEl = document.getElementById('llm-model-list');
+  var selectEl = document.getElementById('llm-model-select');
+  resultEl.innerHTML = '<span style="color:var(--text-muted)">Connecting...</span>';
+  try {
+    var resp = await fetch('/api/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: (document.getElementById('llm-base-url') || {}).value || '',
+        api_key: (document.getElementById('llm-api-key') || {}).value || '',
+      }),
+    });
+    var res = await resp.json();
+    if (res.ok) {
+      var models = res.models || [];
+      resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available</span>';
+      if (models.length) {
+        selectEl.innerHTML = models.map(function(m) {
+          return '<option value="' + m + '">' + m + '</option>';
+        }).join('');
+        // Pre-select the currently configured model if it's in the list
+        var current = (document.getElementById('llm-model-name') || {}).value || '';
+        if (current && models.indexOf(current) !== -1) selectEl.value = current;
+        listEl.style.display = 'block';
+      } else {
+        listEl.style.display = 'none';
+      }
+    } else {
+      resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + (res.error || 'Connection failed') + '</span>';
+      listEl.style.display = 'none';
+    }
+  } catch (e) {
+    resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + e.message + '</span>';
+    listEl.style.display = 'none';
+  }
+};
+
 window.testIntegration = async function(type) {
   var resultEl = document.getElementById(type === 'notion' ? 'notion-test-result' : 'webhook-test-result');
   resultEl.innerHTML = '<span style="color:var(--text-muted)">Testing...</span>';

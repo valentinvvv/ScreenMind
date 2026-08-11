@@ -75,6 +75,7 @@ _ALLOWED_OVERRIDES = {
     "defer_analysis", "meeting_transcription",
     "meeting_apps",
     "active_model", "model_variants", "retention_days",
+    "gemma_mode", "llm_api_base_url", "llm_api_key", "llm_model_name",
     "obsidian_enabled", "obsidian_vault_path",
     "notion_enabled", "notion_token", "notion_database_id",
     "webhook_enabled", "webhook_url", "webhook_events", "webhook_secret", "webhook_headers",

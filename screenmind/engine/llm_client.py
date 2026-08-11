@@ -285,3 +285,28 @@ def get_server_status() -> dict:
         return {"status": "unreachable", "detail": f"Cannot connect to {target}"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+
+def list_remote_models(base_url: Optional[str] = None, api_key: Optional[str] = None) -> list:
+    """
+    Fetch the model list from an OpenAI-compatible endpoint (GET /models).
+
+    Args:
+        base_url: Endpoint base URL (defaults to settings.llm_api_base_url)
+        api_key: Bearer key (defaults to settings.llm_api_key)
+
+    Returns a list of model id strings, sorted. Raises on connection/HTTP errors.
+    """
+    url = (base_url or settings.llm_api_base_url).rstrip("/") + "/models"
+    headers = {}
+    key = api_key if api_key is not None else settings.llm_api_key
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    response = httpx.get(url, timeout=HEALTH_TIMEOUT, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    items = data.get("data", []) if isinstance(data, dict) else []
+    return sorted(
+        m["id"] for m in items
+        if isinstance(m, dict) and isinstance(m.get("id"), str)
+    )
