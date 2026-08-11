@@ -316,11 +316,28 @@ class TestCustomBackend:
         assert call_args[0][0] == "http://api.test/v1/models"
         assert call_args[1]["headers"] == {"Authorization": "Bearer sk-test"}
 
+    @patch("screenmind.engine.model_manager.settings")
     @patch("screenmind.engine.llm_client.settings")
-    def test_transcribe_audio_rejected_on_custom(self, mock_settings):
-        """Audio input is not supported by generic OpenAI-compatible endpoints."""
-        mock_settings.gemma_mode = "custom"
-        with pytest.raises(ValueError, match="not supported with custom"):
+    @patch("screenmind.engine.llm_client.chat")
+    def test_transcribe_audio_allowed_on_custom_gemma4(self, mock_chat, mock_lc_settings, mock_mm_settings):
+        """Custom endpoint serving Gemma 4 transcribes audio (native encoder)."""
+        mock_lc_settings.gemma_mode = "custom"
+        mock_lc_settings.llm_model_name = "gemma4:e2b"
+        mock_mm_settings.gemma_mode = "custom"
+        mock_mm_settings.llm_model_name = "gemma4:e2b"
+        mock_chat.return_value = "Hello world"
+        assert transcribe_audio(b"fake wav bytes") == "Hello world"
+        assert mock_chat.called
+
+    @patch("screenmind.engine.model_manager.settings")
+    @patch("screenmind.engine.llm_client.settings")
+    def test_transcribe_audio_rejected_on_custom_non_audio_model(self, mock_lc_settings, mock_mm_settings):
+        """Custom endpoint with a non-audio model still raises ValueError."""
+        mock_lc_settings.gemma_mode = "custom"
+        mock_lc_settings.llm_model_name = "llama3:8b"
+        mock_mm_settings.gemma_mode = "custom"
+        mock_mm_settings.llm_model_name = "llama3:8b"
+        with pytest.raises(ValueError, match="does not support audio"):
             transcribe_audio(b"fake wav bytes")
 
     @patch("screenmind.engine.llm_client.settings")

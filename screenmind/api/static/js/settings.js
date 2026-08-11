@@ -73,7 +73,7 @@ async function renderSettings(el) {
   + '<datalist id="llm-model-options"></datalist>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testLLM()">Test Connection</button><span id="llm-test-result" style="font-size:0.8rem"></span></div>'
   + '</div>'
-  + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription is unavailable in custom mode. <strong>Backend changes require a restart.</strong></div></div>'
+  + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription works whenever the endpoint\'s model has an audio encoder (e.g. Gemma 4 E2B/E4B). <strong>Backend changes require a restart.</strong></div></div>'
   + '<div class="settings-card settings-card-accent" id="model-card" style="display:' + (cfg.gemma_mode === 'custom' ? 'none' : '') + '"><div class="settings-card-header"><div><div class="settings-title">AI Model</div><div class="settings-desc">Select which Gemma model for analysis and chat</div></div></div>'
   + '<div id="model-list" class="model-list"><div class="spinner" style="margin:12px auto"></div></div></div>'
 

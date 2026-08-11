@@ -3,7 +3,8 @@ Unified LLM Client for ScreenMind
 Communicates with the active inference backend via OpenAI-compatible API:
   - gemma_mode=local  → llama-server (llama.cpp) managed by model_manager
   - gemma_mode=custom → any OpenAI-compatible endpoint (llm_api_base_url)
-Supports text, vision (images), and audio input (local mode only).
+Supports text, vision (images), and audio input (any backend whose model has
+an audio encoder — Gemma 4 in local or custom mode).
 
 Inference priority: chat can cancel in-flight analysis via cancel_current_inference().
 llama-server frees the GPU slot when the HTTP client disconnects.
@@ -205,18 +206,12 @@ def transcribe_audio(
     Raises:
         ValueError: If the active backend/model doesn't support audio input.
     """
-    # Guard: custom endpoints rarely accept input_audio content parts
-    if _is_custom_backend():
-        raise ValueError(
-            "Audio transcription is not supported with custom LLM endpoints "
-            "(gemma_mode=custom). Use gemma_mode=local with an audio-capable "
-            "model (Gemma 4 E2B/E4B) for voice memos and meeting transcription."
-        )
-
-    # Guard: check if active model supports audio
+    # Guard: check if active model supports audio (local registry lookup, or
+    # model-name inference for custom endpoints)
     from screenmind.engine import model_manager
     if not model_manager.is_audio_capable():
-        active = model_manager.get_active_model() or "unknown"
+        active = (settings.llm_model_name if _is_custom_backend()
+                  else (model_manager.get_active_model() or "unknown"))
         raise ValueError(
             f"Model '{active}' does not support audio input. "
             f"Switch to Gemma 4 E2B or E4B for voice memo and meeting transcription."

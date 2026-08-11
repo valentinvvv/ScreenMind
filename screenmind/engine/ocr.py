@@ -6,6 +6,7 @@ Uses easyocr with dark-theme preprocessing for robust recognition.
 
 import logging
 import time
+import warnings
 from typing import Optional
 
 from PIL import Image, ImageOps, ImageEnhance
@@ -117,10 +118,19 @@ class OCRExtractor:
             img_array = np.array(processed)
 
             # Run OCR with word-level detail (paragraph=False for per-word boxes)
-            results = self._reader.readtext(
-                img_array, detail=1, paragraph=False,
-                batch_size=4,
-            )
+            # easyocr hardcodes pin_memory=True in its DataLoader; on machines
+            # without a CUDA accelerator torch emits a UserWarning on every call.
+            # Harmless — silence it so it doesn't spam the capture log.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*'pin_memory' argument is set as true but no accelerator is found.*",
+                    category=UserWarning,
+                )
+                results = self._reader.readtext(
+                    img_array, detail=1, paragraph=False,
+                    batch_size=4,
+                )
 
             texts = []
             boxes = []

@@ -356,6 +356,7 @@ async function pollStatus() {
       _modelState.download = s.model.download;
       _modelState.message = s.model.message || '';
       _modelState.externalModel = s.model.external_model || null;
+      _modelState.backend = s.model.backend || 'local';
       if (s.model.capabilities) _modelState.capabilities = s.model.capabilities;
 
       if (prev !== 'ready' && _modelState.status === 'ready') {
@@ -408,6 +409,7 @@ const _modelState = {
   download: null,
   message: '',
   models: [],
+  backend: 'local',  // 'local' | 'custom' — drives audio-warning guidance
   capabilities: null,  // null until first poll — prevents false audio warnings
 };
 

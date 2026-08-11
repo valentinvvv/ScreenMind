@@ -95,22 +95,20 @@ class AudioWorker:
         self._init_transcription()
 
     def _init_transcription(self):
-        """Check that audio transcription is available with the active backend."""
+        """Check that audio transcription is available with the active backend.
+
+        Works for both local llama-server and custom OpenAI-compatible
+        endpoints — audio capability is resolved per-model at record time
+        (model_manager.is_audio_capable), so a custom endpoint serving a
+        Gemma 4 model transcribes just like local mode.
+        """
         try:
-            from screenmind.config import settings as app_settings
-            if app_settings.gemma_mode == "custom":
-                logger.warning(
-                    "Custom LLM endpoint does not support audio input — "
-                    "meeting transcription disabled (use gemma_mode=local to enable)"
-                )
-                self._available = False
-                return
             from screenmind.engine import llm_client
             if llm_client.is_available():
                 self._available = True
-                logger.info("Gemma audio transcription ready (via llama-server).")
+                logger.info("Gemma audio transcription ready.")
             else:
-                logger.warning("llama-server not available — meeting transcription disabled")
+                logger.warning("LLM backend not available — meeting transcription disabled")
                 self._available = False
         except Exception as e:
             logger.warning(f"Transcription init failed: {e}")

@@ -4,6 +4,7 @@ Handles llama-server process lifecycle, GGUF model downloads, and model switchin
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -247,15 +248,38 @@ def _quant_for_hf_file(key: str, hf_file: str) -> str:
     return ""
 
 
+# Model-name patterns indicating native audio input. Gemma 4 (E2B/E4B/12B) has
+# an audio encoder in every size — llama-server exposes it over the same
+# OpenAI-compatible chat API, so custom endpoints serving these models can
+# transcribe voice memos and meetings too.
+_AUDIO_CAPABLE_NAME_RE = re.compile(r"gemma[\s\-_.]*4", re.IGNORECASE)
+
+
+def looks_audio_capable(model_name: Optional[str]) -> bool:
+    """Infer audio capability from an arbitrary (custom endpoint) model name."""
+    return bool(model_name and _AUDIO_CAPABLE_NAME_RE.search(model_name))
+
+
 def is_audio_capable(key: Optional[str] = None) -> bool:
-    """Check if the given (or active) model supports audio input."""
+    """Check if the given (or active) model supports audio input.
+
+    In custom mode there is no local model registry — capability is inferred
+    from the configured endpoint's model name (Gemma 4 models have a native
+    audio encoder).
+    """
+    if key is None and settings.gemma_mode == "custom":
+        return looks_audio_capable(settings.llm_model_name)
     k = key or get_active_model() or settings.active_model
     info = get_model_info(k)
     return info.get("audio", False) if info else False
 
 
 def get_active_capabilities() -> dict:
-    """Get capability flags for the active model."""
+    """Get capability flags for the active model (custom-mode aware)."""
+    if settings.gemma_mode == "custom":
+        # Vision is assumed available (analysis sends images to the endpoint);
+        # audio is inferred from the configured model name.
+        return {"audio": looks_audio_capable(settings.llm_model_name), "vision": True}
     k = get_active_model() or settings.active_model
     info = get_model_info(k)
     if not info:
@@ -770,9 +794,9 @@ def _custom_endpoint_status() -> dict:
         "active_model": settings.llm_model_name,
         "model_downloaded": True,
         "backend": "custom",
-        # Audio input is rejected by llm_client in custom mode; vision is
-        # assumed available (analysis sends images to the endpoint).
-        "capabilities": {"audio": False, "vision": True},
+        # Audio capability is inferred from the configured model name (Gemma 4
+        # models have a native audio encoder); vision is assumed available.
+        "capabilities": get_active_capabilities(),
         "download": None,
     }
     if _probe_custom_endpoint():

@@ -222,6 +222,51 @@ class TestAudioCapability:
             assert caps["audio"] is True
             assert caps["vision"] is True
 
+    # ── Custom-mode capability inference from model name ──
+
+    @pytest.mark.parametrize("name", [
+        "gemma4:e2b",
+        "gemma4:e4b",
+        "gemma-4-E2B-it-Q4_0.gguf",
+        "/home/user/models/gemma-4-E4B_q4_0-it.gguf",
+        "ggml-org/gemma-4-12B-it-GGUF",
+        "Gemma 4 E2B",
+    ])
+    def test_looks_audio_capable_gemma4_names(self, name):
+        """Gemma 4 model names (any spelling/path) are audio-capable."""
+        assert model_manager.looks_audio_capable(name) is True
+
+    @pytest.mark.parametrize("name", [
+        "llama3:8b",
+        "qwen2.5-vl:7b",
+        "mistral-nemo",
+        "",
+        None,
+        "gemma3:4b",  # Gemma 3 has no audio encoder
+    ])
+    def test_looks_audio_capable_non_audio_names(self, name):
+        """Non-Gemma-4 names are not audio-capable."""
+        assert model_manager.looks_audio_capable(name) is False
+
+    @patch.object(model_manager.settings, "llm_model_name", "gemma4:e4b")
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_is_audio_capable_custom_gemma4(self):
+        """Custom mode infers audio=True from the configured Gemma 4 model."""
+        assert model_manager.is_audio_capable() is True
+
+    @patch.object(model_manager.settings, "llm_model_name", "llama3:8b")
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_is_audio_capable_custom_non_audio(self):
+        """Custom mode infers audio=False for non-audio models."""
+        assert model_manager.is_audio_capable() is False
+
+    @patch.object(model_manager.settings, "llm_model_name", "gemma4:e2b")
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_capabilities_custom_gemma4(self):
+        """Custom mode capabilities: audio inferred, vision assumed."""
+        caps = model_manager.get_active_capabilities()
+        assert caps == {"audio": True, "vision": True}
+
 
 # ── Switch Model Guards ───────────────────────────────────────────────
 
@@ -393,6 +438,7 @@ class TestGetModelStatus:
             assert status["status"] == "no_model"
 
     @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "llm_model_name", "llama3:8b")
     @patch.object(model_manager.settings, "gemma_mode", "custom")
     def test_custom_mode_ready_when_endpoint_reachable(self, _):
         """Custom mode reports ready without any local model/server."""
@@ -403,7 +449,18 @@ class TestGetModelStatus:
         assert status["model_downloaded"] is True
         assert status["capabilities"]["audio"] is False
 
+    @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "llm_model_name", "gemma4:e2b")
+    @patch.object(model_manager.settings, "gemma_mode", "custom")
+    def test_custom_mode_audio_capable_for_gemma4(self, _):
+        """Custom endpoint serving Gemma 4 reports audio capability."""
+        model_manager._set_download_state(active=False, status="idle")
+        status = model_manager.get_model_status()
+        assert status["capabilities"]["audio"] is True
+        assert status["capabilities"]["vision"] is True
+
     @patch.object(model_manager, "_probe_custom_endpoint", return_value=False)
+    @patch.object(model_manager.settings, "llm_model_name", "llama3:8b")
     @patch.object(model_manager.settings, "gemma_mode", "custom")
     def test_custom_mode_error_when_endpoint_unreachable(self, _):
         """Custom mode reports error with a message when endpoint is down."""
@@ -414,6 +471,7 @@ class TestGetModelStatus:
         assert "message" in status and status["message"]
 
     @patch.object(model_manager, "_probe_custom_endpoint", return_value=True)
+    @patch.object(model_manager.settings, "llm_model_name", "llama3:8b")
     @patch.object(model_manager.settings, "gemma_mode", "custom")
     def test_custom_mode_ignores_download_state(self, _):
         """Custom mode never reports local download/lifecycle states."""
