@@ -460,7 +460,8 @@ class GemmaAnalyzer:
             except Exception as e:
                 elapsed = time.time() - start_time
                 if attempt == 0:
-                    logger.warning(f"Balanced analysis error, retrying: {e}")
+                    logger.warning(f"Balanced analysis error, retrying in 15s: {e}")
+                    time.sleep(15)  # Backoff — server may be busy with another request
                     continue
                 logger.error(f"Balanced analysis failed after {elapsed:.1f}s: {e}")
 

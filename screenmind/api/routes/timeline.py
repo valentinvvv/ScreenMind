@@ -11,6 +11,9 @@ from screenmind.api.dependencies import db
 
 router = APIRouter(prefix="/api", tags=["timeline"])
 
+# Serialize re-analyze requests — llama.cpp is single-slot, concurrent requests get 500
+_reanalyze_lock = asyncio.Lock()
+
 
 @router.get("/timeline")
 async def get_timeline(
@@ -85,94 +88,94 @@ async def reanalyze_activity(activity_id: int):
     from screenmind.engine.layout_analyzer import organize_ocr_text, cluster_ocr_layout
     from screenmind.config import settings as app_settings
 
-    try:
-        from screenmind.privacy.encryption import open_image as _enc_open
-        img = _enc_open(ss_path)
-
-        # Re-run Gemma analysis (respects analysis_mode setting)
-        ocr_text = row[1] or ""
-        app_name = row[3] or None
-        window_title = row[4] or None
-
-        # Extract URLs from OCR text (same as analysis_worker)
-        from screenmind.workers.analysis_worker import _extract_all_urls
-        active_urls = _extract_all_urls(ocr_text) if ocr_text else []
-
-        analyzer = GemmaAnalyzer()
+    async with _reanalyze_lock:
         try:
-            _MODE_MAP = {
-                "fast": analyzer.analyze_screenshot_fast,
-                "balanced": analyzer.analyze_screenshot_balanced,
-                "merged": analyzer.analyze_screenshot,
-            }
-            analyze_fn = _MODE_MAP.get(app_settings.analysis_mode, analyzer.analyze_screenshot_fast)
-            record, layout_regions = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: analyze_fn(
-                        image=img,
-                        window_title=window_title,
-                        app_name_hint=app_name,
-                        ocr_text=ocr_text,
-                        active_urls=active_urls,
-                    ),
-                ),
-                timeout=300,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="Re-analysis timed out (server unresponsive)")
+            from screenmind.privacy.encryption import open_image as _enc_open
+            img = _enc_open(ss_path)
 
+            # Re-run Gemma analysis (respects analysis_mode setting)
+            ocr_text = row[1] or ""
+            app_name = row[3] or None
+            window_title = row[4] or None
 
-        # Organize text using layout regions (Gemma regions or OCR clustering)
-        organized_text = ""
-        ocr_boxes_raw = row[2]
-        if ocr_boxes_raw:
-            ocr_boxes = json.loads(ocr_boxes_raw)
+            # Extract URLs from OCR text (same as analysis_worker)
+            from screenmind.workers.analysis_worker import _extract_all_urls
+            active_urls = _extract_all_urls(ocr_text) if ocr_text else []
+
+            analyzer = GemmaAnalyzer()
             try:
-                screen_w, screen_h = img.size
-                regions = layout_regions if layout_regions else cluster_ocr_layout(ocr_boxes, screen_w, screen_h)
-                organized_text = organize_ocr_text(
-                    ocr_boxes, regions, screen_w, screen_h
-                )
-            except Exception as e:
-                organized_text = ""  # Non-fatal — skip layout on error
-
-        # Generate embedding for semantic search
-        embedding = None
-        try:
-            from screenmind.api.dependencies import embedder as _emb
-            if _emb:
-                embedding = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: _emb.embed_activity(
-                        summary=record.activity_summary,
-                        details=record.detailed_context,
-                        visible_text=record.visible_text_snippets,
-                        app_name=record.app_name,
-                        category=record.activity_category,
-                        scene_description=record.scene_description,
+                _MODE_MAP = {
+                    "fast": analyzer.analyze_screenshot_fast,
+                    "balanced": analyzer.analyze_screenshot_balanced,
+                    "merged": analyzer.analyze_screenshot,
+                }
+                analyze_fn = _MODE_MAP.get(app_settings.analysis_mode, analyzer.analyze_screenshot_fast)
+                record, layout_regions = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: analyze_fn(
+                            image=img,
+                            window_title=window_title,
+                            app_name_hint=app_name,
+                            ocr_text=ocr_text,
+                            active_urls=active_urls,
+                        ),
                     ),
+                    timeout=300,
                 )
-        except Exception:
-            pass  # Non-fatal — search still works via FTS
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="Re-analysis timed out (server unresponsive)")
 
-        # Update DB (handles FTS5 sync automatically)
-        db.update_activity_analysis(
-            activity_id=activity_id,
-            analysis=record,
-            embedding=embedding,
-            ocr_text=ocr_text,
-            organized_text=organized_text,
-            analysis_method="reanalyze",
-        )
+            # Organize text using layout regions (Gemma regions or OCR clustering)
+            organized_text = ""
+            ocr_boxes_raw = row[2]
+            if ocr_boxes_raw:
+                ocr_boxes = json.loads(ocr_boxes_raw)
+                try:
+                    screen_w, screen_h = img.size
+                    regions = layout_regions if layout_regions else cluster_ocr_layout(ocr_boxes, screen_w, screen_h)
+                    organized_text = organize_ocr_text(
+                        ocr_boxes, regions, screen_w, screen_h
+                    )
+                except Exception as e:
+                    organized_text = ""  # Non-fatal — skip layout on error
 
-        return {
-            "reanalyzed": True,
-            "activity_id": activity_id,
-            "summary": record.activity_summary,
-            "category": record.activity_category,
-        }
-    except HTTPException:
-        raise  # Re-raise timeout 504
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Re-analysis failed: {str(e)[:200]}")
+            # Generate embedding for semantic search
+            embedding = None
+            try:
+                from screenmind.api.dependencies import embedder as _emb
+                if _emb:
+                    embedding = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: _emb.embed_activity(
+                            summary=record.activity_summary,
+                            details=record.detailed_context,
+                            visible_text=record.visible_text_snippets,
+                            app_name=record.app_name,
+                            category=record.activity_category,
+                            scene_description=record.scene_description,
+                        ),
+                    )
+            except Exception:
+                pass  # Non-fatal — search still works via FTS
+
+            # Update DB (handles FTS5 sync automatically)
+            db.update_activity_analysis(
+                activity_id=activity_id,
+                analysis=record,
+                embedding=embedding,
+                ocr_text=ocr_text,
+                organized_text=organized_text,
+                analysis_method="reanalyze",
+            )
+
+            return {
+                "reanalyzed": True,
+                "activity_id": activity_id,
+                "summary": record.activity_summary,
+                "category": record.activity_category,
+            }
+        except HTTPException:
+            raise  # Re-raise timeout 504
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Re-analysis failed: {str(e)[:200]}")

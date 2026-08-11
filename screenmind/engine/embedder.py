@@ -5,7 +5,7 @@ sentence-transformers. Used for natural language search over activities.
 """
 
 import logging
-import numpy as np
+import threading
 from typing import List, Optional
 
 logger = logging.getLogger("screenmind.engine.embedder")
@@ -21,10 +21,15 @@ class Embedder:
         self._model_name = model_name
         self._model = None
         self._initialized = False
+        self._lock = threading.Lock()
 
     def _ensure_model(self):
-        """Lazy-load the embedding model on first use."""
-        if not self._initialized:
+        """Lazy-load the embedding model on first use (thread-safe)."""
+        if self._initialized:
+            return
+        with self._lock:
+            if self._initialized:
+                return
             try:
                 from sentence_transformers import SentenceTransformer
 
