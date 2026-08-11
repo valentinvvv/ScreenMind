@@ -68,13 +68,13 @@ async function renderSettings(el) {
   + '<div class="settings-input-row"><label class="settings-label">API Key:</label>'
   + '<input type="password" id="llm-api-key" class="settings-text-input" value="" placeholder="' + (cfg.llm_api_key_set ? '(unchanged \u2014 key is set)' : 'leave empty if not required') + '"></div>'
   + '<div class="settings-input-row"><label class="settings-label">Model:</label>'
-  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="llm-model-name" class="settings-text-input" style="flex:1" value="' + (cfg.llm_model_name || '') + '" placeholder="gemma4:e2b">'
+  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="llm-model-name" class="settings-text-input" style="flex:1" list="llm-model-options" value="' + (cfg.llm_model_name || '') + '" placeholder="gemma4:e2b">'
   + '<button class="btn btn-sm" onclick="testLLM()">Fetch models from server</button></div></div>'
-  + '<div id="llm-model-list" style="display:none;margin-top:6px"><select id="llm-model-select" class="settings-text-input" style="width:100%"></select></div>'
+  + '<datalist id="llm-model-options"></datalist>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testLLM()">Test Connection</button><span id="llm-test-result" style="font-size:0.8rem"></span></div>'
   + '</div>'
   + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription is unavailable in custom mode. <strong>Backend changes require a restart.</strong></div></div>'
-  + '<div class="settings-card settings-card-accent" id="model-card"><div class="settings-card-header"><div><div class="settings-title">AI Model</div><div class="settings-desc">Select which Gemma model for analysis and chat</div></div></div>'
+  + '<div class="settings-card settings-card-accent" id="model-card" style="display:' + (cfg.gemma_mode === 'custom' ? 'none' : '') + '"><div class="settings-card-header"><div><div class="settings-title">AI Model</div><div class="settings-desc">Select which Gemma model for analysis and chat</div></div></div>'
   + '<div id="model-list" class="model-list"><div class="spinner" style="margin:12px auto"></div></div></div>'
 
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Performance Mode</div><div class="settings-desc">Controls GPU layer offloading for inference</div></div></div>'
@@ -221,21 +221,16 @@ async function renderSettings(el) {
       radio.closest('.radio-pill').classList.add('active');
     });
   });
-  // LLM Backend radio → show/hide custom endpoint fields
+  // LLM Backend radio → show/hide custom endpoint fields + local-only model card
   el.querySelectorAll('input[name="gemma_mode"]').forEach(function(radio) {
     radio.addEventListener('change', function() {
+      var custom = radio.value === 'custom' && radio.checked;
       var fields = document.getElementById('llm-custom-fields');
-      if (fields) fields.style.display = (radio.value === 'custom' && radio.checked) ? 'block' : 'none';
+      if (fields) fields.style.display = custom ? 'block' : 'none';
+      var modelCard = document.getElementById('model-card');
+      if (modelCard) modelCard.style.display = custom ? 'none' : '';
     });
   });
-  // Remote model dropdown → populate the model name input
-  var llmModelSelect = document.getElementById('llm-model-select');
-  if (llmModelSelect) {
-    llmModelSelect.addEventListener('change', function() {
-      var nameInput = document.getElementById('llm-model-name');
-      if (nameInput && llmModelSelect.value) nameInput.value = llmModelSelect.value;
-    });
-  }
   el.querySelectorAll('#retention-group input').forEach(function(radio) {
     radio.addEventListener('change', updateStorageEstimate);
   });
@@ -589,8 +584,7 @@ window.removePIN = async function() {
 };
 window.testLLM = async function() {
   var resultEl = document.getElementById('llm-test-result');
-  var listEl = document.getElementById('llm-model-list');
-  var selectEl = document.getElementById('llm-model-select');
+  var optionsEl = document.getElementById('llm-model-options');
   resultEl.innerHTML = '<span style="color:var(--text-muted)">Connecting...</span>';
   try {
     var resp = await fetch('/api/llm/test', {
@@ -604,25 +598,18 @@ window.testLLM = async function() {
     var res = await resp.json();
     if (res.ok) {
       var models = res.models || [];
-      resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available</span>';
-      if (models.length) {
-        selectEl.innerHTML = models.map(function(m) {
-          return '<option value="' + m + '">' + m + '</option>';
+      resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available \u2014 pick one from the Model field</span>';
+      // Populate the datalist so the single Model field offers suggestions
+      if (optionsEl) {
+        optionsEl.innerHTML = models.map(function(m) {
+          return '<option value="' + m + '">';
         }).join('');
-        // Pre-select the currently configured model if it's in the list
-        var current = (document.getElementById('llm-model-name') || {}).value || '';
-        if (current && models.indexOf(current) !== -1) selectEl.value = current;
-        listEl.style.display = 'block';
-      } else {
-        listEl.style.display = 'none';
       }
     } else {
       resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + (res.error || 'Connection failed') + '</span>';
-      listEl.style.display = 'none';
     }
   } catch (e) {
     resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + e.message + '</span>';
-    listEl.style.display = 'none';
   }
 };
 
