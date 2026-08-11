@@ -434,31 +434,42 @@ class GemmaAnalyzer:
         image_bytes = self._image_to_bytes(image)
 
         start_time = time.time()
-        try:
-            # chat_with_images() — no prefill = natural thinking enabled
-            raw_response = llm_client.chat_with_images(
-                prompt=prompt,
-                images=[image_bytes],
-                temperature=0.0,
-                max_tokens=1024,
-            )
+        for attempt in range(2):
+            try:
+                # chat_with_images() — no prefill = natural thinking enabled
+                raw_response = llm_client.chat_with_images(
+                    prompt=prompt,
+                    images=[image_bytes],
+                    temperature=0.0 if attempt == 0 else 0.1,
+                    max_tokens=2048,
+                )
 
-            elapsed = time.time() - start_time
-            logger.info(f"Balanced analysis done in {elapsed:.1f}s")
+                elapsed = time.time() - start_time
+                logger.info(f"Balanced analysis done in {elapsed:.1f}s")
 
-            # _parse_response() strips <think>...</think> tags before JSON parsing
-            record = self._parse_response(raw_response, app_name_hint, window_title)
-            return record, []
+                # _parse_response() strips <think>...</think> tags before JSON parsing
+                record = self._parse_response(raw_response, app_name_hint, window_title)
 
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"Balanced analysis error after {elapsed:.1f}s: {e}")
-            return ActivityRecord(
-                app_name=app_name_hint or "unknown",
-                activity_category="other",
-                activity_summary=f"Analysis failed: {str(e)[:100]}",
-                confidence=0.0,
-            ), []
+                # If regex fallback produced the failure placeholder, retry inference
+                if record.activity_summary == "Unable to parse response" and attempt == 0:
+                    logger.warning("Balanced parse failed, retrying inference...")
+                    continue
+
+                return record, []
+
+            except Exception as e:
+                elapsed = time.time() - start_time
+                if attempt == 0:
+                    logger.warning(f"Balanced analysis error, retrying: {e}")
+                    continue
+                logger.error(f"Balanced analysis failed after {elapsed:.1f}s: {e}")
+
+        return ActivityRecord(
+            app_name=app_name_hint or "unknown",
+            activity_category="other",
+            activity_summary="Analysis failed",
+            confidence=0.0,
+        ), []
 
     def analyze_screenshot_fast(
         self,
@@ -705,6 +716,17 @@ class GemmaAnalyzer:
                 return self._normalize(record, app_name_hint, window_title)
             except (json.JSONDecodeError, Exception) as e:
                 logger.debug(f"JSON parse error: {e}")
+
+            # Repair attempt — fix trailing commas, missing braces, unescaped newlines
+            repaired = self._repair_json(json_str)
+            if repaired:
+                try:
+                    data = json.loads(repaired)
+                    logger.debug("JSON repaired successfully (balanced mode)")
+                    record = ActivityRecord(**data)
+                    return self._normalize(record, app_name_hint, window_title)
+                except Exception:
+                    pass
 
         # Fallback: try to extract key fields with regex
         logger.debug("Falling back to regex extraction")
