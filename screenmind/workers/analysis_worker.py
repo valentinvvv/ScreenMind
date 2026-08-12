@@ -149,7 +149,7 @@ class AnalysisWorker:
         try:
             conn = self._db._get_conn()
             pending = conn.execute(
-                "SELECT COUNT(*) FROM activities WHERE (analyzed = 0 OR summary = 'Skipped (analysis backlog)' OR summary LIKE 'Analysis failed%') AND DATE(timestamp) = DATE('now', 'localtime')"
+                "SELECT COUNT(*) FROM activities WHERE (analyzed = 0 OR summary = 'Skipped (analysis backlog)' OR summary LIKE 'Analysis failed%') AND timestamp >= datetime('now', 'localtime', '-24 hours')"
             ).fetchone()[0]
             if pending:
                 logger.info(f"Found {pending} unanalyzed entries — will backfill during idle")
@@ -666,7 +666,7 @@ class AnalysisWorker:
                    WHERE (analyzed = 0
                       OR summary = 'Skipped (analysis backlog)'
                       OR summary LIKE 'Analysis failed%')
-                     AND DATE(timestamp) = DATE('now', 'localtime')
+                     AND timestamp >= datetime('now', 'localtime', '-24 hours')
                    ORDER BY timestamp DESC LIMIT 20""",
             ).fetchall()
 
