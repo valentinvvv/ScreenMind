@@ -259,6 +259,8 @@ class TestCustomBackend:
         mock_settings.llm_api_base_url = "http://api.test/v1/"
         mock_settings.llm_api_key = "sk-test"
         mock_settings.llm_model_name = "test-model"
+        mock_settings.text_llm_model_name = None
+        mock_settings.text_llm_routing = "off"
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
         mock_resp.raise_for_status = MagicMock()
@@ -279,6 +281,8 @@ class TestCustomBackend:
         mock_settings.llm_api_base_url = "http://localhost:11434/v1"
         mock_settings.llm_api_key = None
         mock_settings.llm_model_name = "gemma4:e2b"
+        mock_settings.text_llm_model_name = None
+        mock_settings.text_llm_routing = "off"
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
         mock_resp.raise_for_status = MagicMock()
@@ -410,3 +414,124 @@ class TestListRemoteModels:
         mock_get.return_value = mock_resp
         with pytest.raises(httpx.HTTPStatusError):
             list_remote_models("http://api.test/v1", "bad-key")
+
+
+class TestErrorDetailSurfacing:
+    """Server error bodies must reach the user — a bare '400 Bad Request' hid
+    the real cause of summary-generation failures (context overflow)."""
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_error_includes_json_error_message(self, mock_client_cls):
+        """llama.cpp-style {"error": {"message": ...}} detail lands in the exception."""
+        resp = httpx.Response(
+            400,
+            request=httpx.Request("POST", "http://api.test/v1/chat/completions"),
+            json={"error": {
+                "message": "request (10476 tokens) exceeds the available context size (6144 tokens), try increasing it",
+                "type": "exceed_context_size_error",
+            }},
+        )
+        mock_client_cls.return_value.post.return_value = resp
+        with pytest.raises(httpx.HTTPStatusError, match="exceeds the available context size"):
+            chat([{"role": "user", "content": "test"}])
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_error_includes_plain_text_body(self, mock_client_cls):
+        """Non-JSON error bodies are surfaced too."""
+        resp = httpx.Response(
+            400,
+            request=httpx.Request("POST", "http://api.test/v1/chat/completions"),
+            text="model not loaded",
+        )
+        mock_client_cls.return_value.post.return_value = resp
+        with pytest.raises(httpx.HTTPStatusError, match="model not loaded"):
+            chat([{"role": "user", "content": "test"}])
+
+
+class TestTextModelRouting:
+    """Second model on the custom endpoint handles text-only operations."""
+
+    def _mock_settings(self, mock_settings, routing="overflow", text_model="big-model",
+                       text_window=32768, context_window=6144):
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://api.test/v1"
+        mock_settings.llm_api_key = None
+        mock_settings.llm_model_name = "primary-model"
+        mock_settings.text_llm_model_name = text_model
+        mock_settings.text_llm_routing = routing
+        mock_settings.text_llm_context_window = text_window
+        mock_settings.context_window = context_window
+
+    def _chat_ok(self, mock_client_cls):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_always_routes_text_to_text_model(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, routing="always")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "big-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_overflow_routes_large_text_to_text_model(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, routing="overflow")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "x" * 20000}], max_tokens=2048)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "big-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_overflow_keeps_small_text_on_primary(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, routing="overflow")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "x" * 1000}], max_tokens=256)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_off_never_routes(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, routing="off")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "x" * 20000}], max_tokens=2048)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_multimodal_never_routes_even_on_always(self, mock_client_cls, mock_settings):
+        """Vision/audio requests always stay on the primary model."""
+        self._mock_settings(mock_settings, routing="always")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+        ]}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_no_text_model_configured_stays_primary(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, routing="always", text_model="")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    def test_local_backend_never_routes(self, mock_settings):
+        """llama-server serves one model — routing is custom-endpoint only."""
+        mock_settings.gemma_mode = "local"
+        mock_settings.text_llm_model_name = "big-model"
+        mock_settings.text_llm_routing = "always"
+        mock_settings.text_llm_context_window = 32768
+        from screenmind.engine.llm_client import _route_to_text_model
+        assert _route_to_text_model([{"role": "user", "content": "x" * 20000}], 2048) is False

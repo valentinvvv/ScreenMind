@@ -76,6 +76,7 @@ _ALLOWED_OVERRIDES = {
     "meeting_apps",
     "active_model", "model_variants", "retention_days",
     "gemma_mode", "llm_api_base_url", "llm_api_key", "llm_model_name",
+    "text_llm_model_name", "text_llm_routing", "text_llm_context_window",
     "obsidian_enabled", "obsidian_vault_path",
     "notion_enabled", "notion_token", "notion_database_id",
     "webhook_enabled", "webhook_url", "webhook_events", "webhook_secret", "webhook_headers",
@@ -139,6 +140,20 @@ class Settings(BaseSettings):
     llm_model_name: str = Field(
         default="gemma4:e2b",
         description="Model name sent to the custom LLM endpoint (gemma_mode=custom)",
+    )
+    text_llm_model_name: Optional[str] = Field(
+        default=None,
+        description="Secondary model on the custom endpoint for text-only operations (summaries, chat, agents). Empty = disabled",
+    )
+    text_llm_routing: Literal["off", "overflow", "always"] = Field(
+        default="off",
+        description="Text-model routing: 'off' = primary model only, 'overflow' = text requests exceeding Context Window go to the text model, 'always' = all text operations go to the text model",
+    )
+    text_llm_context_window: int = Field(
+        default=32768,
+        description="Context window of the text model in tokens — used to budget prompts routed to it",
+        ge=2048,
+        le=1048576,
     )
     ollama_model: str = Field(
         default="gemma4:e2b",

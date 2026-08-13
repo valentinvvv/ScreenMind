@@ -11,6 +11,7 @@ llama-server frees the GPU slot when the HTTP client disconnects.
 """
 
 import base64
+import json
 import logging
 import threading
 import time
@@ -26,6 +27,35 @@ logger = logging.getLogger("screenmind.engine.llm_client")
 # Timeout for inference calls (screenshots can take 30-60s on slow hardware)
 INFERENCE_TIMEOUT = 300.0
 HEALTH_TIMEOUT = 5.0
+
+# Gemma tokenizes dense screen/code text at ~2 chars/token (measured against
+# llama.cpp: 8600 chars of activity lines = 3015 tokens). Used to budget
+# prompts against settings.context_window without a tokenizer dependency.
+CHARS_PER_TOKEN = 2.0
+
+
+def _raise_with_detail(response: httpx.Response) -> None:
+    """raise_for_status() with the server's error body surfaced in the message.
+
+    llama.cpp/Ollama-style bodies: {"error": {"message": "...", "type": "..."}}.
+    A bare "400 Bad Request" hides the actual cause (e.g. context overflow).
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        detail = response.text.strip()
+        try:
+            parsed = response.json()
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict) and err.get("message"):
+                detail = str(err["message"])
+            elif isinstance(err, str) and err:
+                detail = err
+        except (ValueError, AttributeError):
+            pass
+        raise httpx.HTTPStatusError(
+            f"{e} — {detail[:500]}", request=e.request, response=e.response
+        ) from None
 
 
 class InferenceCancelled(Exception):
@@ -86,6 +116,40 @@ def _auth_headers() -> dict:
         return {"Authorization": f"Bearer {settings.llm_api_key}"}
     return {}
 
+def _is_text_only(messages: list) -> bool:
+    """True when every message content is a plain string (no images/audio parts)."""
+    return bool(messages) and all(isinstance(m.get("content"), str) for m in messages)
+
+
+def _text_model_configured() -> bool:
+    """Text-model routing needs the custom endpoint (llama-server serves one model)."""
+    return _is_custom_backend() and bool((settings.text_llm_model_name or "").strip())
+
+
+def text_model_window() -> Optional[int]:
+    """Context window of the configured text model, or None when routing is
+    unavailable (model unset, routing 'off', or non-custom backend)."""
+    if not _text_model_configured() or settings.text_llm_routing == "off":
+        return None
+    return settings.text_llm_context_window
+
+
+def _route_to_text_model(messages: list, max_tokens: int) -> bool:
+    """Decide whether this request goes to the secondary text model.
+
+    - 'always':   every text-only request (vision/audio always stay on primary)
+    - 'overflow': text-only requests whose estimated prompt + max_tokens exceed
+                  the primary Context Window
+    Token estimate uses the same conservative CHARS_PER_TOKEN as prompt budgeting.
+    """
+    window = text_model_window()
+    if window is None or not _is_text_only(messages):
+        return False
+    if settings.text_llm_routing == "always":
+        return True
+    est_tokens = sum(int(len(m.get("content", "")) / CHARS_PER_TOKEN) for m in messages)
+    return est_tokens + max_tokens > settings.context_window
+
 
 def chat(
     messages: list,
@@ -117,6 +181,7 @@ def chat(
         url = f"{_base_url()}/chat/completions"
     else:
         url = f"{_base_url()}/v1/chat/completions"
+    use_text_model = _route_to_text_model(messages, max_tokens)
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -124,7 +189,9 @@ def chat(
     }
     if _is_custom_backend():
         # OpenAI-compatible APIs require the model identifier in the payload
-        payload["model"] = settings.llm_model_name
+        payload["model"] = (
+            settings.text_llm_model_name if use_text_model else settings.llm_model_name
+        )
 
     # Create a dedicated client for this request so it can be closed independently
     client = httpx.Client(timeout=timeout)
@@ -133,7 +200,7 @@ def chat(
 
     try:
         response = client.post(url, json=payload, headers=_auth_headers())
-        response.raise_for_status()
+        _raise_with_detail(response)
         data = response.json()
         return data["choices"][0]["message"]["content"]
     except Exception as e:

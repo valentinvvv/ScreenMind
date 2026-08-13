@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query
 
 from screenmind.config import settings
 from screenmind.api.dependencies import db
+from screenmind.engine.llm_client import CHARS_PER_TOKEN, text_model_window
 
 logger = logging.getLogger("screenmind.api.routes.summary")
 
@@ -72,6 +73,71 @@ def _compute_day_metrics(activities: list) -> dict:
     }
 
 
+# Reserved for the prompt template + model output when budgeting activity text
+# against the context window.
+_PROMPT_OVERHEAD_TOKENS = 500
+
+
+def _budget_chars(window: int, max_tokens: int) -> int:
+    """Max chars of activity text for a window, at the worst-case token density."""
+    return max(int((window - max_tokens - _PROMPT_OVERHEAD_TOKENS) * CHARS_PER_TOKEN), 0)
+
+
+def _pick_window(full_block_chars: int, out_tokens: int) -> int:
+    """Context window the summary prompt is budgeted against.
+
+    With a configured text model: 'always' routing budgets against the text
+    model's window outright; 'overflow' routing does so when the full day
+    would exceed the primary Context Window. llm_client.chat() makes the same
+    routing decision, so a prompt sized for the text window lands on the text
+    model instead of being rejected with HTTP 400.
+    """
+    tw = text_model_window()
+    if tw is None or settings.text_llm_routing == "off":
+        return settings.context_window
+    if settings.text_llm_routing == "always":
+        return tw
+    est_tokens = int(full_block_chars / CHARS_PER_TOKEN) + out_tokens + _PROMPT_OVERHEAD_TOKENS
+    return tw if est_tokens > settings.context_window else settings.context_window
+
+
+def _build_activity_block(
+    activities: list, max_rich: int, rich_chars: int, budget_chars: int
+) -> tuple:
+    """Render analyzed activities as prompt lines, capped at budget_chars.
+
+    The backend rejects oversized prompts with HTTP 400 (llama.cpp:
+    "request (N tokens) exceeds the available context size"), so the block is
+    capped and the OLDEST entries are dropped first — recent activity matters
+    most in a day summary.
+
+    Returns (block_text, entry_count).
+    """
+    # Build newest-first so the limited rich-content slots go to the most
+    # recent activity (original behavior), then reverse to chronological order.
+    entries = []
+    rich_count = 0
+    for a in sorted(activities, key=lambda x: x.get("timestamp", ""), reverse=True):
+        if not a.get("analyzed"):
+            continue
+        entry = f"[{a.get('timestamp', '')}] {a.get('app_name', '?')} ({a.get('category', '?')}): {a.get('summary', '')}"
+        if rich_count < max_rich:
+            org_text = (a.get("organized_text") or "").strip()
+            if org_text:
+                if len(org_text) > rich_chars:
+                    org_text = org_text[:rich_chars] + "..."
+                entry += f"\n  Screen content: {org_text}"
+                rich_count += 1
+        entries.append(entry)
+    entries.reverse()
+
+    total = sum(len(e) for e in entries) + max(len(entries) - 1, 0)
+    while entries and total > budget_chars:
+        total -= len(entries.pop(0)) + 1
+
+    return "\n".join(entries), len(entries)
+
+
 @router.get("/summary")
 async def get_summary(
     date: str = Query(default=None),
@@ -85,7 +151,7 @@ async def get_summary(
 async def generate_summary(
     date: str = Query(default=None),
 ):
-    """Generate a daily summary using Gemma 4."""
+    """Generate a daily summary using the configured LLM backend."""
     from screenmind.engine import llm_client
     from screenmind.storage.models import DailySummary
 
@@ -95,29 +161,14 @@ async def generate_summary(
     if not activities:
         return {"date": target, "summary": {"summary": "No activities recorded on this date."}}
 
-    # Build rich context
-    MAX_RICH = 20
-    act_entries = []
-    rich_count = 0
-    for a in activities:
-        if not a.get("analyzed"):
-            continue
-        time_str = a.get("timestamp", "")
-        app = a.get("app_name", "?")
-        cat = a.get("category", "?")
-        summary = a.get("summary", "")
-        entry = f"[{time_str}] {app} ({cat}): {summary}"
-        if rich_count < MAX_RICH:
-            org_text = (a.get("organized_text") or "").strip()
-            if org_text:
-                if len(org_text) > 300:
-                    org_text = org_text[:300] + "..."
-                entry += f"\n  Screen content: {org_text}"
-                rich_count += 1
-        act_entries.append(entry)
-
-    acts_text = "\n".join(act_entries)
-    act_count = len(act_entries)
+    # Full render decides whether the day overflows to the text model
+    full_block, _ = _build_activity_block(activities, 20, 300, budget_chars=10**9)
+    window = _pick_window(len(full_block), 2048)
+    out_tokens = min(2048, window // 2)
+    acts_text, act_count = _build_activity_block(
+        activities, max_rich=20, rich_chars=300,
+        budget_chars=_budget_chars(window, out_tokens),
+    )
 
     prompt = f"""Summarize this user's day based on their screen activities.
 
@@ -138,7 +189,7 @@ Write the summary:"""
             lambda: llm_client.generate(
                 prompt=prompt,
                 temperature=0.3,
-                max_tokens=2048,
+                max_tokens=out_tokens,
             ),
         )
     except Exception as e:
@@ -167,7 +218,7 @@ Write the summary:"""
 async def generate_standup(
     date: str = Query(default=None),
 ):
-    """Generate standup notes."""
+    """Generate standup notes using the configured LLM backend."""
     from screenmind.engine import llm_client
 
     target = date or str(__import__("datetime").date.today())
@@ -176,25 +227,13 @@ async def generate_standup(
     if not activities:
         return {"date": target, "standup": "No activities to summarize."}
 
-    MAX_RICH = 15
-    act_entries = []
-    rich_count = 0
-    for a in activities:
-        if not a.get("analyzed"):
-            continue
-        app = a.get("app_name", "?")
-        summary = a.get("summary", "")
-        entry = f"- {app}: {summary}"
-        if rich_count < MAX_RICH:
-            org_text = (a.get("organized_text") or "").strip()
-            if org_text:
-                if len(org_text) > 200:
-                    org_text = org_text[:200] + "..."
-                entry += f"\n  Content: {org_text}"
-                rich_count += 1
-        act_entries.append(entry)
-
-    acts_text = "\n".join(act_entries)
+    full_block, _ = _build_activity_block(activities, 15, 200, budget_chars=10**9)
+    window = _pick_window(len(full_block), 1024)
+    out_tokens = min(1024, window // 2)
+    acts_text, _ = _build_activity_block(
+        activities, max_rich=15, rich_chars=200,
+        budget_chars=_budget_chars(window, out_tokens),
+    )
 
     prompt = f"""Generate standup notes from these screen activities.
 
@@ -221,7 +260,7 @@ Activities:
             lambda: llm_client.generate(
                 prompt=prompt,
                 temperature=0.3,
-                max_tokens=1024,
+                max_tokens=out_tokens,
             ),
         )
     except Exception as e:

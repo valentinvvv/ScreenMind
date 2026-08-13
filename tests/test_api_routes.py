@@ -5,6 +5,7 @@ from datetime import datetime
 from unittest.mock import patch
 
 from screenmind.storage.models import ScreenshotEntry, ActivityRecord
+from screenmind.config import settings
 import screenmind.api.dependencies as deps
 
 
@@ -183,3 +184,149 @@ async def test_models_list(client):
     data = resp.json()
     assert "models" in data
     assert len(data["models"]) >= 1
+
+
+def _seed_busy_day(db, n=200):
+    """Insert n analyzed activities with large organized_text for 2026-05-16."""
+    from datetime import timedelta
+    base = datetime(2026, 5, 16, 8, 0, 0)
+    for i in range(n):
+        entry = ScreenshotEntry(
+            timestamp=base + timedelta(seconds=40 * i),
+            screenshot_path=f"/tmp/{i}.jpg",
+            window_title=f"Window {i}",
+            analyzed=True,
+        )
+        aid = db.insert_activity(entry)
+        db.update_activity_analysis(
+            aid,
+            ActivityRecord(
+                app_name="Code",
+                activity_category="coding",
+                activity_summary=f"Editing file_{i}.py in repo src/auth/jwt.ts const token = req.headers",
+            ),
+            organized_text=f"src/auth/jwt.ts | const token = req.headers.authorization?.split(' ')[1] | line {i} " * 4,
+        )
+
+
+class TestSummaryPromptBudget:
+    """Regression: busy-day summary prompts overflowed the context window and
+    the backend rejected them with HTTP 400 (exceed_context_size_error)."""
+
+    def test_block_fits_context_window(self, db):
+        """200 rich activities are trimmed to the configured context budget."""
+        from screenmind.api.routes.summary import _build_activity_block, _budget_chars
+        _seed_busy_day(db, n=200)
+        activities = db.get_activities_by_date("2026-05-16", limit=200)
+        assert len(activities) == 200
+
+        budget = _budget_chars(settings.context_window, 2048)
+        block, count = _build_activity_block(
+            activities, max_rich=20, rich_chars=300, budget_chars=budget
+        )
+        assert len(block) <= budget
+        assert 0 < count < 200  # trimmed, not emptied
+        # Oldest dropped first: newest entry survives, oldest doesn't
+        assert "file_199.py" in block
+        assert "file_0.py" not in block
+
+    def test_small_day_keeps_everything(self, db):
+        """A short day fits whole — no trimming."""
+        from screenmind.api.routes.summary import _build_activity_block, _budget_chars
+        _seed_busy_day(db, n=5)
+        activities = db.get_activities_by_date("2026-05-16", limit=200)
+        block, count = _build_activity_block(
+            activities, max_rich=20, rich_chars=300,
+            budget_chars=_budget_chars(settings.context_window, 2048),
+        )
+        assert count == 5
+        for i in range(5):
+            assert f"file_{i}.py" in block
+
+    def test_rich_slots_go_to_newest(self, db):
+        """Limited Screen-content slots attach to the most recent activity."""
+        from screenmind.api.routes.summary import _build_activity_block
+        _seed_busy_day(db, n=30)
+        activities = db.get_activities_by_date("2026-05-16", limit=200)
+        block, _ = _build_activity_block(
+            activities, max_rich=5, rich_chars=300, budget_chars=10**9
+        )
+        # newest entry has Screen content, oldest does not
+        newest_chunk = block.split("[2026-05-16T")[-1]
+        assert "Screen content" in newest_chunk
+        oldest_chunk = block.split("\n[")[0]
+        assert "Screen content" not in oldest_chunk
+
+    @pytest.mark.asyncio
+    async def test_generate_summary_prompt_within_budget(self, client, db):
+        """POST /api/summary/generate sends a prompt that fits the window."""
+        _seed_busy_day(db, n=200)
+        captured = {}
+
+        def fake_generate(prompt, temperature=0.3, max_tokens=1024, timeout=None):
+            captured["prompt"] = prompt
+            captured["max_tokens"] = max_tokens
+            return "A productive day of coding."
+
+        with patch("screenmind.engine.llm_client.generate", side_effect=fake_generate):
+            resp = await client.post("/api/summary/generate?date=2026-05-16")
+
+        assert resp.status_code == 200
+        assert resp.json()["summary"]["summary"] == "A productive day of coding."
+        # At the measured worst-case density (2 chars/token) the whole prompt
+        # plus the requested output must fit the context window.
+        prompt_tokens = len(captured["prompt"]) / 2
+        assert prompt_tokens + captured["max_tokens"] <= settings.context_window
+
+
+class TestTextModelWindowPick:
+    """Summary budget follows the text-model routing switch."""
+
+    def _pick(self, full_chars, out_tokens, routing, text_window=32768):
+        from screenmind.api.routes import summary as sm
+        with patch.object(sm, "text_model_window", return_value=text_window), \
+             patch.object(sm.settings, "text_llm_routing", routing):
+            return sm._pick_window(full_chars, out_tokens)
+
+    def test_no_text_model_uses_primary_window(self):
+        from screenmind.api.routes import summary as sm
+        with patch.object(sm, "text_model_window", return_value=None):
+            assert sm._pick_window(100000, 2048) == settings.context_window
+
+    def test_always_uses_text_window(self):
+        assert self._pick(10, 2048, "always") == 32768
+
+    def test_overflow_large_day_uses_text_window(self):
+        # 20k chars ≈ 10k tokens > 6144 primary window
+        assert self._pick(20000, 2048, "overflow") == 32768
+
+    def test_overflow_small_day_stays_primary(self):
+        # 2k chars ≈ 1k tokens + output fits the primary window
+        assert self._pick(2000, 2048, "overflow") == settings.context_window
+
+    def test_off_uses_primary_window(self):
+        assert self._pick(100000, 2048, "off") == settings.context_window
+
+    @pytest.mark.asyncio
+    async def test_generate_summary_routes_busy_day_to_text_window(self, client, db):
+        """Busy day + overflow routing → prompt sized for the text model."""
+        _seed_busy_day(db, n=200)
+        captured = {}
+
+        def fake_generate(prompt, temperature=0.3, max_tokens=1024, timeout=None):
+            captured["prompt"] = prompt
+            captured["max_tokens"] = max_tokens
+            return "ok"
+
+        from screenmind.api.routes import summary as sm
+        with patch("screenmind.engine.llm_client.generate", side_effect=fake_generate), \
+             patch.object(sm, "text_model_window", return_value=32768), \
+             patch.object(sm.settings, "text_llm_routing", "overflow"):
+            resp = await client.post("/api/summary/generate?date=2026-05-16")
+
+        assert resp.status_code == 200
+        # Prompt must fit the TEXT window now — and use far more of the day
+        # than the primary-window budget allowed.
+        prompt_tokens = len(captured["prompt"]) / 2
+        assert prompt_tokens + captured["max_tokens"] <= 32768
+        assert prompt_tokens > settings.context_window  # overflowed the primary

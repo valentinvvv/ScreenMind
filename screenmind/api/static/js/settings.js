@@ -71,6 +71,13 @@ async function renderSettings(el) {
   + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="llm-model-name" class="settings-text-input" style="flex:1" list="llm-model-options" value="' + (cfg.llm_model_name || '') + '" placeholder="gemma4:e2b">'
   + '<button class="btn btn-sm" onclick="testLLM()">Fetch models from server</button></div></div>'
   + '<datalist id="llm-model-options"></datalist>'
+  + '<div class="settings-input-row"><label class="settings-label">Text Model:</label>'
+  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="text-llm-model-name" class="settings-text-input" style="flex:1" list="llm-model-options" value="' + (cfg.text_llm_model_name || '') + '" placeholder="optional \u2014 larger-context model for long text jobs"></div></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Text Routing:</label>'
+  + '<div class="radio-group">' + _rp('text_llm_routing','off','Off',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','overflow','On overflow',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','always','Always',cfg.text_llm_routing || 'off') + '</div></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Text Model Context:</label>'
+  + '<input type="number" id="text-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.text_llm_context_window || 32768) + '"></div>'
+  + '<div class="settings-note" style="margin-top:4px">Optional second model on the same endpoint for text-only operations (summaries, chat, agents). <strong>On overflow</strong>: text requests that exceed the Context Window above go to this model. <strong>Always</strong>: all text operations use it. Screenshots and audio always stay on the primary model. Leave empty to disable.</div>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testLLM()">Test Connection</button><span id="llm-test-result" style="font-size:0.8rem"></span></div>'
   + '</div>'
   + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription works whenever the endpoint\'s model has an audio encoder (e.g. Gemma 4 E2B/E4B). <strong>Backend changes require a restart.</strong></div></div>'
@@ -514,6 +521,9 @@ window.saveSettings = async function() {
     llm_api_base_url: (document.getElementById('llm-base-url') || {}).value || '',
     llm_api_key: (document.getElementById('llm-api-key') || {}).value || undefined,
     llm_model_name: (document.getElementById('llm-model-name') || {}).value || '',
+    text_llm_model_name: (document.getElementById('text-llm-model-name') || {}).value || '',
+    text_llm_routing: (document.querySelector('input[name="text_llm_routing"]:checked') || {}).value || 'off',
+    text_llm_context_window: parseInt((document.getElementById('text-llm-context-window') || {}).value) || 32768,
     // Integrations
     obsidian_enabled: (document.getElementById('obsidian-enabled') || {}).checked || false,
     obsidian_vault_path: (document.getElementById('obsidian-vault-path') || {}).value || '',
