@@ -9,7 +9,9 @@
 #endif
 #define MyAppPublisher "valentinvvv"
 #define MyAppURL "https://github.com/valentinvvv/ScreenMind"
+#ifndef RuntimeDir
 #define RuntimeDir "runtime"
+#endif
 
 [Setup]
 AppId={{8F4C2E61-9B3A-4D5E-A7F0-1C2D3E4F5A60}

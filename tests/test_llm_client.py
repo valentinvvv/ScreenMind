@@ -112,6 +112,30 @@ class TestChat:
         with pytest.raises(httpx.HTTPStatusError):
             chat([{"role": "user", "content": "test"}])
 
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_null_content_returns_empty_string(self, mock_client_cls):
+        """content: null (empty/filtered completion) returns "" — never None.
+
+        Regression: a None return crashed callers on answer.strip() with
+        'NoneType' object has no attribute 'strip'.
+        """
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": None}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+        result = chat([{"role": "user", "content": "hi"}])
+        assert result == ""
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_malformed_response_raises_value_error(self, mock_client_cls):
+        """A response without choices/message raises a descriptive ValueError."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "chatcmpl-x"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+        with pytest.raises(ValueError, match="Malformed LLM response"):
+            chat([{"role": "user", "content": "hi"}])
+
 
 class TestChatWithImages:
     """Tests for chat_with_images()."""

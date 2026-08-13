@@ -58,6 +58,29 @@ def _raise_with_detail(response: httpx.Response) -> None:
         ) from None
 
 
+def _extract_content(data) -> str:
+    """Extract the assistant text from an OpenAI-style completion response.
+
+    Returns "" when content is null/absent — some endpoints signal an empty or
+    filtered completion that way (frequent with text-only models). Callers
+    already handle empty answers (retry / vision fallback), so this preserves
+    chat()'s `-> str` contract instead of leaking None into downstream
+    `.strip()` calls. Raises ValueError on a structurally malformed response so
+    the real problem surfaces instead of a NoneType crash.
+    """
+    try:
+        message = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(
+            f"Malformed LLM response (missing choices/message): {str(data)[:200]}"
+        ) from e
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        logger.debug("LLM response had no string content (%s) — treating as empty", type(content).__name__)
+        return ""
+    return content
+
+
 class InferenceCancelled(Exception):
     """Raised when an in-flight inference is cancelled (e.g., chat pre-emption)."""
     pass
@@ -234,7 +257,7 @@ def chat(
         response = client.post(url, json=payload, headers=headers)
         _raise_with_detail(response)
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        return _extract_content(data)
     except Exception as e:
         # Check if this was a cancellation (flag set + connection error)
         if _cancel_event.is_set():

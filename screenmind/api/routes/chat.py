@@ -567,6 +567,11 @@ async def chat_with_memory(request: Request):
             else:
                 answer = f"Sorry, I'm having trouble connecting: {str(e)[:100]}"
 
+        if not answer.strip():
+            answer = ("The model returned an empty response. This can happen with text-only "
+                      "models when the reply is filtered or truncated — try rephrasing "
+                      "or switching models in Settings.")
+
         elapsed = round(time.time() - t0, 1)
         yield send_progress(f"✅ {elapsed}s")
         yield send_answer(answer, sources, mode, elapsed)
