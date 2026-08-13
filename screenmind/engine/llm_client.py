@@ -122,13 +122,37 @@ def _is_text_only(messages: list) -> bool:
 
 
 def _text_model_configured() -> bool:
-    """Text-model routing needs the custom endpoint (llama-server serves one model)."""
-    return _is_custom_backend() and bool((settings.text_llm_model_name or "").strip())
+    """A text model needs a name plus a reachable endpoint: either its own
+    TEXT_LLM_API_BASE_URL, or the primary custom endpoint to ride on."""
+    if not (settings.text_llm_model_name or "").strip():
+        return False
+    return bool((settings.text_llm_api_base_url or "").strip()) or _is_custom_backend()
+
+
+def _text_base_url() -> str:
+    """Base URL of the text-model endpoint (falls back to the primary endpoint)."""
+    url = (settings.text_llm_api_base_url or "").strip()
+    return url.rstrip("/") if url else _base_url()
+
+
+def _text_auth_headers() -> dict:
+    """Authorization header for the text endpoint.
+
+    Own key when set; otherwise the primary key, but only while the text model
+    shares the primary endpoint (empty text URL). A distinct endpoint with no
+    key gets no header — the primary key is never sent to a different server.
+    """
+    key = (settings.text_llm_api_key or "").strip()
+    if key:
+        return {"Authorization": f"Bearer {key}"}
+    if not (settings.text_llm_api_base_url or "").strip():
+        return _auth_headers()
+    return {}
 
 
 def text_model_window() -> Optional[int]:
     """Context window of the configured text model, or None when routing is
-    unavailable (model unset, routing 'off', or non-custom backend)."""
+    unavailable (model unset or routing 'off')."""
     if not _text_model_configured() or settings.text_llm_routing == "off":
         return None
     return settings.text_llm_context_window
@@ -177,17 +201,25 @@ def chat(
     # from a previous cancel_current_inference() call that had nothing to cancel
     _cancel_event.clear()
 
-    if _is_custom_backend():
-        url = f"{_base_url()}/chat/completions"
-    else:
-        url = f"{_base_url()}/v1/chat/completions"
     use_text_model = _route_to_text_model(messages, max_tokens)
+    if use_text_model:
+        # The text model is always addressed as an OpenAI-compatible endpoint,
+        # even when the primary backend is the local llama-server.
+        url = f"{_text_base_url()}/chat/completions"
+        headers = _text_auth_headers()
+    else:
+        url = (
+            f"{_base_url()}/chat/completions"
+            if _is_custom_backend()
+            else f"{_base_url()}/v1/chat/completions"
+        )
+        headers = _auth_headers()
     payload = {
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if _is_custom_backend():
+    if use_text_model or _is_custom_backend():
         # OpenAI-compatible APIs require the model identifier in the payload
         payload["model"] = (
             settings.text_llm_model_name if use_text_model else settings.llm_model_name
@@ -199,7 +231,7 @@ def chat(
         _active_client = client
 
     try:
-        response = client.post(url, json=payload, headers=_auth_headers())
+        response = client.post(url, json=payload, headers=headers)
         _raise_with_detail(response)
         data = response.json()
         return data["choices"][0]["message"]["content"]

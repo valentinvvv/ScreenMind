@@ -513,7 +513,9 @@ All settings configurable via `.env`, environment variables, or the **Settings**
 | `LLM_API_BASE_URL` | `http://localhost:11434/v1` | Endpoint for `GEMMA_MODE=custom` (Ollama, vLLM, LM Studio, cloud, ...) |
 | `LLM_API_KEY` | *(unset)* | API key for the custom endpoint (leave unset if not required) |
 | `LLM_MODEL_NAME` | `gemma4:e2b` | Model name sent to the custom endpoint |
-| `TEXT_LLM_MODEL_NAME` | *(empty)* | Optional second model on the custom endpoint for text-only ops (summaries, chat, agents). Screenshots/audio stay on `LLM_MODEL_NAME` |
+| `TEXT_LLM_API_BASE_URL` | *(empty)* | Endpoint of the text model. Empty = ride the primary endpoint |
+| `TEXT_LLM_API_KEY` | *(empty)* | API key for the text endpoint. Empty = reuse `LLM_API_KEY` while sharing the primary endpoint |
+| `TEXT_LLM_MODEL_NAME` | *(empty)* | Optional second model for text-only ops (summaries, chat, agents). Screenshots/audio stay on `LLM_MODEL_NAME` |
 | `TEXT_LLM_ROUTING` | `off` | `off`, `overflow` (text requests exceeding Context Window), or `always` (all text ops) |
 | `TEXT_LLM_CONTEXT_WINDOW` | `32768` | Context window of the text model in tokens — used to budget prompts routed to it |
 | `ANALYSIS_MODE` | `fast` | `fast` (~12s), `balanced` (~40s), or `merged` (~76s, accurate) |

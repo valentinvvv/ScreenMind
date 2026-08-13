@@ -449,14 +449,17 @@ class TestErrorDetailSurfacing:
 
 
 class TestTextModelRouting:
-    """Second model on the custom endpoint handles text-only operations."""
+    """Dedicated text model handles text-only operations on its own endpoint."""
 
     def _mock_settings(self, mock_settings, routing="overflow", text_model="big-model",
-                       text_window=32768, context_window=6144):
+                       text_window=32768, context_window=6144,
+                       text_url="", text_key=None):
         mock_settings.gemma_mode = "custom"
         mock_settings.llm_api_base_url = "http://api.test/v1"
         mock_settings.llm_api_key = None
         mock_settings.llm_model_name = "primary-model"
+        mock_settings.text_llm_api_base_url = text_url
+        mock_settings.text_llm_api_key = text_key
         mock_settings.text_llm_model_name = text_model
         mock_settings.text_llm_routing = routing
         mock_settings.text_llm_context_window = text_window
@@ -527,9 +530,61 @@ class TestTextModelRouting:
         assert payload["model"] == "primary-model"
 
     @patch("screenmind.engine.llm_client.settings")
-    def test_local_backend_never_routes(self, mock_settings):
-        """llama-server serves one model — routing is custom-endpoint only."""
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_text_model_uses_own_endpoint_url_and_key(self, mock_client_cls, mock_settings):
+        """A configured text endpoint gets its own URL and its own key."""
+        self._mock_settings(mock_settings, routing="always",
+                            text_url="http://text.test/v1/", text_key="sk-text")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://text.test/v1/chat/completions"
+        assert call_args[1]["json"]["model"] == "big-model"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-text"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_text_model_on_shared_endpoint_reuses_primary_key(self, mock_client_cls, mock_settings):
+        """Empty text URL rides the primary endpoint — primary key applies."""
+        self._mock_settings(mock_settings, routing="always")
+        mock_settings.llm_api_key = "sk-primary"
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://api.test/v1/chat/completions"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-primary"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_text_model_own_endpoint_without_key_sends_no_auth(self, mock_client_cls, mock_settings):
+        """The primary key is never forwarded to a different endpoint."""
+        self._mock_settings(mock_settings, routing="always", text_url="http://text.test/v1")
+        mock_settings.llm_api_key = "sk-primary"
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[1]["headers"] == {}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_local_primary_with_own_text_url_routes(self, mock_client_cls, mock_settings):
+        """Local llama-server primary + dedicated text endpoint → routing works."""
+        self._mock_settings(mock_settings, routing="always", text_url="http://text.test/v1")
         mock_settings.gemma_mode = "local"
+        mock_settings.llama_server_host = "http://127.0.0.1:5809"
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://text.test/v1/chat/completions"
+        assert call_args[1]["json"]["model"] == "big-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    def test_local_primary_without_text_url_never_routes(self, mock_settings):
+        """llama-server serves one model — without a text URL there is nowhere
+        to route to."""
+        mock_settings.gemma_mode = "local"
+        mock_settings.text_llm_api_base_url = ""
+        mock_settings.text_llm_api_key = None
         mock_settings.text_llm_model_name = "big-model"
         mock_settings.text_llm_routing = "always"
         mock_settings.text_llm_context_window = 32768

@@ -71,18 +71,28 @@ async function renderSettings(el) {
   + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="llm-model-name" class="settings-text-input" style="flex:1" list="llm-model-options" value="' + (cfg.llm_model_name || '') + '" placeholder="gemma4:e2b">'
   + '<button class="btn btn-sm" onclick="testLLM()">Fetch models from server</button></div></div>'
   + '<datalist id="llm-model-options"></datalist>'
-  + '<div class="settings-input-row"><label class="settings-label">Text Model:</label>'
-  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="text-llm-model-name" class="settings-text-input" style="flex:1" list="llm-model-options" value="' + (cfg.text_llm_model_name || '') + '" placeholder="optional \u2014 larger-context model for long text jobs"></div></div>'
-  + '<div class="settings-input-row"><label class="settings-label">Text Routing:</label>'
-  + '<div class="radio-group">' + _rp('text_llm_routing','off','Off',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','overflow','On overflow',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','always','Always',cfg.text_llm_routing || 'off') + '</div></div>'
-  + '<div class="settings-input-row"><label class="settings-label">Text Model Context:</label>'
-  + '<input type="number" id="text-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.text_llm_context_window || 32768) + '"></div>'
-  + '<div class="settings-note" style="margin-top:4px">Optional second model on the same endpoint for text-only operations (summaries, chat, agents). <strong>On overflow</strong>: text requests that exceed the Context Window above go to this model. <strong>Always</strong>: all text operations use it. Screenshots and audio always stay on the primary model. Leave empty to disable.</div>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testLLM()">Test Connection</button><span id="llm-test-result" style="font-size:0.8rem"></span></div>'
   + '</div>'
   + '<div class="settings-note" style="margin-top:8px">Local: ScreenMind manages llama-server and Gemma models below. Custom: any OpenAI-compatible server (Ollama, vLLM, LM Studio, cloud providers). Audio transcription works whenever the endpoint\'s model has an audio encoder (e.g. Gemma 4 E2B/E4B). <strong>Backend changes require a restart.</strong></div></div>'
   + '<div class="settings-card settings-card-accent" id="model-card" style="display:' + (cfg.gemma_mode === 'custom' ? 'none' : '') + '"><div class="settings-card-header"><div><div class="settings-title">AI Model</div><div class="settings-desc">Select which Gemma model for analysis and chat</div></div></div>'
   + '<div id="model-list" class="model-list"><div class="spinner" style="margin:12px auto"></div></div></div>'
+
+  // ── TEXT MODEL (own card — works with local and custom primary backends) ──
+  + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Text Model</div><div class="settings-desc">Optional second model for text-only operations \u2014 summaries, chat, agents</div></div></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Endpoint URL:</label>'
+  + '<input type="text" id="text-llm-base-url" class="settings-text-input" value="' + (cfg.text_llm_api_base_url || '') + '" placeholder="leave empty to use the primary endpoint"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">API Key:</label>'
+  + '<input type="password" id="text-llm-api-key" class="settings-text-input" value="" placeholder="' + (cfg.text_llm_api_key_set ? '(unchanged \u2014 key is set)' : 'leave empty to reuse the primary key') + '"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Model:</label>'
+  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="text-llm-model-name" class="settings-text-input" style="flex:1" list="text-llm-model-options" value="' + (cfg.text_llm_model_name || '') + '" placeholder="e.g. a large-context model">'
+  + '<button class="btn btn-sm" onclick="testTextLLM()">Fetch models from server</button></div></div>'
+  + '<datalist id="text-llm-model-options"></datalist>'
+  + '<div class="settings-input-row"><label class="settings-label">Routing:</label>'
+  + '<div class="radio-group">' + _rp('text_llm_routing','off','Off',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','overflow','On overflow',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','always','Always',cfg.text_llm_routing || 'off') + '</div></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Context Window:</label>'
+  + '<input type="number" id="text-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.text_llm_context_window || 32768) + '"></div>'
+  + '<div class="settings-note" style="margin-top:4px"><strong>On overflow</strong>: text requests that exceed the primary Context Window go to this model. <strong>Always</strong>: all text operations use it. Screenshots and audio always stay on the primary model. Leave Model empty to disable.</div>'
+  + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testTextLLM()">Test Connection</button><span id="text-llm-test-result" style="font-size:0.8rem"></span></div></div>'
 
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Performance Mode</div><div class="settings-desc">Controls GPU layer offloading for inference</div></div></div>'
   + '<div class="settings-note">Minimal = CPU-only (0 VRAM). Balanced = ~15 layers on GPU (~2GB). Maximum = all layers on GPU (~3GB, fastest).</div>'
@@ -521,6 +531,8 @@ window.saveSettings = async function() {
     llm_api_base_url: (document.getElementById('llm-base-url') || {}).value || '',
     llm_api_key: (document.getElementById('llm-api-key') || {}).value || undefined,
     llm_model_name: (document.getElementById('llm-model-name') || {}).value || '',
+    text_llm_api_base_url: (document.getElementById('text-llm-base-url') || {}).value || '',
+    text_llm_api_key: (document.getElementById('text-llm-api-key') || {}).value || undefined,
     text_llm_model_name: (document.getElementById('text-llm-model-name') || {}).value || '',
     text_llm_routing: (document.querySelector('input[name="text_llm_routing"]:checked') || {}).value || 'off',
     text_llm_context_window: parseInt((document.getElementById('text-llm-context-window') || {}).value) || 32768,
@@ -610,6 +622,44 @@ window.testLLM = async function() {
       var models = res.models || [];
       resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available \u2014 pick one from the Model field</span>';
       // Populate the datalist so the single Model field offers suggestions
+      if (optionsEl) {
+        optionsEl.innerHTML = models.map(function(m) {
+          return '<option value="' + m + '">';
+        }).join('');
+      }
+    } else {
+      resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + (res.error || 'Connection failed') + '</span>';
+    }
+  } catch (e) {
+    resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + e.message + '</span>';
+  }
+};
+
+window.testTextLLM = async function() {
+  var resultEl = document.getElementById('text-llm-test-result');
+  var optionsEl = document.getElementById('text-llm-model-options');
+  var textUrl = (document.getElementById('text-llm-base-url') || {}).value || '';
+  var primaryCustom = ((document.querySelector('input[name="gemma_mode"]:checked') || {}).value === 'custom');
+  // Empty text URL = rides the primary endpoint (custom mode only)
+  var baseUrl = textUrl || (primaryCustom ? ((document.getElementById('llm-base-url') || {}).value || '') : '');
+  if (!baseUrl) {
+    resultEl.innerHTML = '<span style="color:#f59e0b">Set the Endpoint URL first</span>';
+    return;
+  }
+  var apiKey = textUrl
+    ? ((document.getElementById('text-llm-api-key') || {}).value || '')
+    : ((document.getElementById('llm-api-key') || {}).value || '');
+  resultEl.innerHTML = '<span style="color:var(--text-muted)">Connecting...</span>';
+  try {
+    var resp = await fetch('/api/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    });
+    var res = await resp.json();
+    if (res.ok) {
+      var models = res.models || [];
+      resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available</span>';
       if (optionsEl) {
         optionsEl.innerHTML = models.map(function(m) {
           return '<option value="' + m + '">';

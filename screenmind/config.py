@@ -76,7 +76,8 @@ _ALLOWED_OVERRIDES = {
     "meeting_apps",
     "active_model", "model_variants", "retention_days",
     "gemma_mode", "llm_api_base_url", "llm_api_key", "llm_model_name",
-    "text_llm_model_name", "text_llm_routing", "text_llm_context_window",
+    "text_llm_api_base_url", "text_llm_api_key", "text_llm_model_name",
+    "text_llm_routing", "text_llm_context_window",
     "obsidian_enabled", "obsidian_vault_path",
     "notion_enabled", "notion_token", "notion_database_id",
     "webhook_enabled", "webhook_url", "webhook_events", "webhook_secret", "webhook_headers",
@@ -141,9 +142,17 @@ class Settings(BaseSettings):
         default="gemma4:e2b",
         description="Model name sent to the custom LLM endpoint (gemma_mode=custom)",
     )
+    text_llm_api_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL of the text-model endpoint. Empty = same endpoint as LLM_API_BASE_URL",
+    )
+    text_llm_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for the text-model endpoint. Empty = reuse LLM_API_KEY",
+    )
     text_llm_model_name: Optional[str] = Field(
         default=None,
-        description="Secondary model on the custom endpoint for text-only operations (summaries, chat, agents). Empty = disabled",
+        description="Secondary model for text-only operations (summaries, chat, agents). Empty = disabled",
     )
     text_llm_routing: Literal["off", "overflow", "always"] = Field(
         default="off",
