@@ -316,9 +316,15 @@ class TestCustomBackend:
 
         assert mock_client_cls.return_value.post.call_args[1]["headers"] == {}
 
+    @patch("screenmind.engine.llm_client.settings")
     @patch("screenmind.engine.llm_client.httpx.Client")
-    def test_chat_local_mode_unchanged(self, mock_client_cls):
+    def test_chat_local_mode_unchanged(self, mock_client_cls, mock_settings):
         """Local mode keeps /v1/chat/completions and omits the model field."""
+        mock_settings.gemma_mode = "local"
+        mock_settings.llama_server_host = "http://127.0.0.1:5809"
+        mock_settings.text_llm_routing = "off"
+        mock_settings.text_llm_model_name = None
+        mock_settings.text_llm_api_base_url = None
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
         mock_resp.raise_for_status = MagicMock()
@@ -601,6 +607,31 @@ class TestTextModelRouting:
         call_args = mock_client_cls.return_value.post.call_args
         assert call_args[0][0] == "http://text.test/v1/chat/completions"
         assert call_args[1]["json"]["model"] == "big-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_text_model_request_disables_thinking(self, mock_client_cls, mock_settings):
+        """Reasoning models burn max_tokens on hidden thinking and return
+        content: null — text-model requests must send enable_thinking: false.
+
+        Regression: qwen3.5-9b on vLLM produced empty agent output and
+        'model returned an empty response' in chat until thinking was off.
+        """
+        self._mock_settings(mock_settings, routing="always")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_primary_request_omits_thinking_knob(self, mock_client_cls, mock_settings):
+        """Primary-backend requests never carry chat_template_kwargs."""
+        self._mock_settings(mock_settings, routing="off")
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert "chat_template_kwargs" not in payload
 
     @patch("screenmind.engine.llm_client.settings")
     def test_local_primary_without_text_url_never_routes(self, mock_settings):

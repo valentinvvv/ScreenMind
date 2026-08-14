@@ -12,13 +12,25 @@ from screenmind.config import settings
 
 @pytest.fixture(autouse=True)
 def _pin_local_backend():
-    """Tests assume the default local backend. The developer's real
-    ~/.screenmind/settings.json may set gemma_mode=custom — don't let it
-    leak into tests that exercise local-mode behavior."""
-    original = settings.gemma_mode
+    """Tests assume the default local backend with no text-model routing.
+    The developer's real ~/.screenmind/settings.json may set gemma_mode=custom
+    or configure a text model — don't let it leak into tests."""
+    original = {
+        k: getattr(settings, k)
+        for k in (
+            "gemma_mode", "text_llm_routing", "text_llm_model_name",
+            "text_llm_api_base_url", "text_llm_api_key", "text_llm_context_window",
+        )
+    }
     settings.gemma_mode = "local"
+    settings.text_llm_routing = "off"
+    settings.text_llm_model_name = None
+    settings.text_llm_api_base_url = None
+    settings.text_llm_api_key = None
+    settings.text_llm_context_window = 32768
     yield
-    settings.gemma_mode = original
+    for k, v in original.items():
+        setattr(settings, k, v)
 
 
 @pytest.fixture

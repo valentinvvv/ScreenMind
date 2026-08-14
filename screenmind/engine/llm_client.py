@@ -247,6 +247,13 @@ def chat(
         payload["model"] = (
             settings.text_llm_model_name if use_text_model else settings.llm_model_name
         )
+    if use_text_model:
+        # Reasoning models (Qwen3, DeepSeek-R1, ...) spend max_tokens on hidden
+        # thinking and then return content: null with finish_reason: length.
+        # ScreenMind never reads the reasoning field and budgets output tightly
+        # (768-1024 tokens), so thinking turns text ops into empty responses.
+        # chat_template_kwargs is vLLM's knob; other servers ignore it.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     # Create a dedicated client for this request so it can be closed independently
     client = httpx.Client(timeout=timeout)
