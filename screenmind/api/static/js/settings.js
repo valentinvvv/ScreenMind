@@ -94,6 +94,23 @@ async function renderSettings(el) {
   + '<div class="settings-note" style="margin-top:4px"><strong>On overflow</strong>: text requests that exceed the primary Context Window go to this model. <strong>Always</strong>: all text operations use it. Screenshots and audio always stay on the primary model. Leave Model empty to disable.</div>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testTextLLM()">Test Connection</button><span id="text-llm-test-result" style="font-size:0.8rem"></span></div></div>'
 
+  // ── VISION MODEL (own card — dedicated model for screenshot analysis) ──
+  + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Vision Model</div><div class="settings-desc">Optional dedicated model for screenshot analysis and vision chat</div></div>'
+  + _sw('vision-llm-enabled', cfg.vision_llm_enabled === true) + '</div>'
+  + '<div id="vision-llm-fields" style="display:' + (cfg.vision_llm_enabled ? 'block' : 'none') + '">'
+  + '<div class="settings-input-row"><label class="settings-label">Endpoint URL:</label>'
+  + '<input type="text" id="vision-llm-base-url" class="settings-text-input" value="' + (cfg.vision_llm_api_base_url || '') + '" placeholder="leave empty to use the primary endpoint"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">API Key:</label>'
+  + '<input type="password" id="vision-llm-api-key" class="settings-text-input" value="" placeholder="' + (cfg.vision_llm_api_key_set ? '(unchanged \u2014 key is set)' : 'leave empty to reuse the primary key') + '"></div>'
+  + '<div class="settings-input-row"><label class="settings-label">Model:</label>'
+  + '<div style="display:flex;gap:8px;flex:1;align-items:center"><input type="text" id="vision-llm-model-name" class="settings-text-input" style="flex:1" list="vision-llm-model-options" value="' + (cfg.vision_llm_model_name || '') + '" placeholder="e.g. a vision-capable model">'
+  + '<button class="btn btn-sm" onclick="testVisionLLM()">Fetch models from server</button></div></div>'
+  + '<datalist id="vision-llm-model-options"></datalist>'
+  + '<div class="settings-input-row"><label class="settings-label">Context Window:</label>'
+  + '<input type="number" id="vision-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.vision_llm_context_window || 32768) + '"></div>'
+  + '<div class="settings-note" style="margin-top:4px">When enabled, screenshot analysis and image chat go to this model instead of the primary one. Audio transcription stays on the primary model. Toggle off (or leave Model empty) to keep everything on the primary model.</div>'
+  + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testVisionLLM()">Test Connection</button><span id="vision-llm-test-result" style="font-size:0.8rem"></span></div></div></div>'
+
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Performance Mode</div><div class="settings-desc">Controls GPU layer offloading for inference</div></div></div>'
   + '<div class="settings-note">Minimal = CPU-only (0 VRAM). Balanced = ~15 layers on GPU (~2GB). Maximum = all layers on GPU (~3GB, fastest).</div>'
   + '<div class="radio-group" id="perf-mode">' + _rp('perf','minimal','Minimal',cfg.performance_mode) + _rp('perf','balanced','Balanced',cfg.performance_mode) + _rp('perf','maximum','Maximum',cfg.performance_mode) + '</div></div>'
@@ -248,6 +265,14 @@ async function renderSettings(el) {
       if (modelCard) modelCard.style.display = custom ? 'none' : '';
     });
   });
+  // Vision Model toggle → show/hide its fields
+  var visionToggle = document.getElementById('vision-llm-enabled');
+  if (visionToggle) {
+    visionToggle.addEventListener('change', function() {
+      var fields = document.getElementById('vision-llm-fields');
+      if (fields) fields.style.display = visionToggle.checked ? 'block' : 'none';
+    });
+  }
   el.querySelectorAll('#retention-group input').forEach(function(radio) {
     radio.addEventListener('change', updateStorageEstimate);
   });
@@ -536,6 +561,11 @@ window.saveSettings = async function() {
     text_llm_model_name: (document.getElementById('text-llm-model-name') || {}).value || '',
     text_llm_routing: (document.querySelector('input[name="text_llm_routing"]:checked') || {}).value || 'off',
     text_llm_context_window: parseInt((document.getElementById('text-llm-context-window') || {}).value) || 32768,
+    vision_llm_enabled: (document.getElementById('vision-llm-enabled') || {}).checked || false,
+    vision_llm_api_base_url: (document.getElementById('vision-llm-base-url') || {}).value || '',
+    vision_llm_api_key: (document.getElementById('vision-llm-api-key') || {}).value || undefined,
+    vision_llm_model_name: (document.getElementById('vision-llm-model-name') || {}).value || '',
+    vision_llm_context_window: parseInt((document.getElementById('vision-llm-context-window') || {}).value) || 32768,
     // Integrations
     obsidian_enabled: (document.getElementById('obsidian-enabled') || {}).checked || false,
     obsidian_vault_path: (document.getElementById('obsidian-vault-path') || {}).value || '',
@@ -648,6 +678,44 @@ window.testTextLLM = async function() {
   }
   var apiKey = textUrl
     ? ((document.getElementById('text-llm-api-key') || {}).value || '')
+    : ((document.getElementById('llm-api-key') || {}).value || '');
+  resultEl.innerHTML = '<span style="color:var(--text-muted)">Connecting...</span>';
+  try {
+    var resp = await fetch('/api/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    });
+    var res = await resp.json();
+    if (res.ok) {
+      var models = res.models || [];
+      resultEl.innerHTML = '<span style="color:#10b981">\u2713 Connected \u2014 ' + models.length + ' model(s) available</span>';
+      if (optionsEl) {
+        optionsEl.innerHTML = models.map(function(m) {
+          return '<option value="' + m + '">';
+        }).join('');
+      }
+    } else {
+      resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + (res.error || 'Connection failed') + '</span>';
+    }
+  } catch (e) {
+    resultEl.innerHTML = '<span style="color:#ef4444">\u2717 ' + e.message + '</span>';
+  }
+};
+
+window.testVisionLLM = async function() {
+  var resultEl = document.getElementById('vision-llm-test-result');
+  var optionsEl = document.getElementById('vision-llm-model-options');
+  var visionUrl = (document.getElementById('vision-llm-base-url') || {}).value || '';
+  var primaryCustom = ((document.querySelector('input[name="gemma_mode"]:checked') || {}).value === 'custom');
+  // Empty vision URL = rides the primary endpoint (custom mode only)
+  var baseUrl = visionUrl || (primaryCustom ? ((document.getElementById('llm-base-url') || {}).value || '') : '');
+  if (!baseUrl) {
+    resultEl.innerHTML = '<span style="color:#f59e0b">Set the Endpoint URL first</span>';
+    return;
+  }
+  var apiKey = visionUrl
+    ? ((document.getElementById('vision-llm-api-key') || {}).value || '')
     : ((document.getElementById('llm-api-key') || {}).value || '');
   resultEl.innerHTML = '<span style="color:var(--text-muted)">Connecting...</span>';
   try {

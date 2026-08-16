@@ -5,4 +5,4 @@ include requirements-test.txt
 include architecture.md
 include .env.example
 recursive-include screenmind/api/static *
-recursive-include screenmind/default_agents *.md
+recursive-include screenmind/default_agents *.md *.py

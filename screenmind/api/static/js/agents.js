@@ -113,6 +113,7 @@ async function renderAgents(el) {
 
       // Action buttons
       html += '<div style="display:flex;gap:6px;margin-top:10px;border-top:1px solid rgba(255,255,255,0.06);padding-top:8px">';
+      html += '<input type="date" id="agent-run-date-' + (a.slug || a.name) + '" title="Leave empty to run for today" style="font-size:0.72rem;padding:3px 6px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);color-scheme:dark">';
       html += '<button class="btn" style="font-size:0.75rem;padding:4px 10px" onclick="runAgentNow(\'' + (a.slug || a.name) + '\')">▶ Run Now</button>';
       html += '<button class="btn" style="font-size:0.75rem;padding:4px 10px" onclick="editAgent(\'' + (a.slug || a.name) + '\')">✏️ Edit</button>';
       html += '<button class="btn" style="font-size:0.75rem;padding:4px 10px" onclick="viewAgentOutputs(\'' + (a.slug || a.name) + '\')">📄 Outputs</button>';
@@ -261,9 +262,16 @@ window.toggleAgent = async function(name, enabled) {
     navigate('agents'); // refresh to show actual state
   }
 };
-window.runAgentNow = async function(name) {
-  showToast('Running ' + name + '...', 'success');
-  var result = await fetch('/api/agents/' + name + '/run', { method:'POST' }).then(r => r.json());
+window.runAgentNow = async function(name, date) {
+  var input = document.getElementById('agent-run-date-' + name);
+  var runDate = date || (input && input.value ? input.value : null);
+  var opts = { method:'POST' };
+  if (runDate) {
+    opts.headers = {'Content-Type':'application/json'};
+    opts.body = JSON.stringify({date: runDate});
+  }
+  showToast('Running ' + name + (runDate ? ' for ' + runDate : '') + '...', 'success');
+  var result = await fetch('/api/agents/' + name + '/run', opts).then(r => r.json());
   if (result.status === 'ok') {
     showToast(name + ' completed (' + result.duration.toFixed(1) + 's)', 'success');
   } else if (result.status === 'needs_approval') {

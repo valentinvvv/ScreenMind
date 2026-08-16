@@ -201,6 +201,8 @@ def _parse_md_frontmatter(filepath: Path) -> dict:
     meta.setdefault("output", "local")
     meta.setdefault("data", "timeline, apps")  # default data sections
     meta.setdefault("model_requirement", "0")  # min context tokens needed
+    meta.setdefault("temperature", "0.3")  # sampling temperature for this agent
+    meta.setdefault("mode", "")  # special output mode, e.g. "timesheet"
     meta["enabled"] = meta["enabled"].lower() in ("true", "yes", "1")
     # Parse data sections into a set
     meta["_data_sections"] = {s.strip().lower() for s in meta["data"].split(",")}
@@ -208,6 +210,10 @@ def _parse_md_frontmatter(filepath: Path) -> dict:
         meta["_model_req"] = int(meta["model_requirement"])
     except (ValueError, TypeError):
         meta["_model_req"] = 0
+    try:
+        meta["_temperature"] = max(0.0, min(float(meta["temperature"]), 2.0))
+    except (ValueError, TypeError):
+        meta["_temperature"] = 0.3
     return meta
 
 
@@ -285,6 +291,476 @@ def _parse_interval_seconds(schedule: str) -> int:
 
 # ── Execution ────────────────────────────────────────────────────────
 
+def _hhmm(timestamp: str) -> str:
+    """Extract HH:MM from an ISO timestamp. Handles both SQLite default
+    ('2026-08-14 10:30:06') and Python isoformat with microseconds
+    ('2026-08-14T10:30:06.985914')."""
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(str(timestamp)).strftime("%H:%M")
+    except (ValueError, TypeError):
+        return "??:??"
+
+
+# ── Timesheet Mode ───────────────────────────────────────────────────
+# Code owns the output format (grouping, sorting, subtotals, ticket
+# numbers, times, customers); the LLM only contributes per-session
+# subjects and justifications. Small local models drift on strict
+# copy-and-edit tasks, so anything format-critical stays deterministic.
+
+_TICKET_NUM_RE = re.compile(r"ticket\s+(\d{4,6})", re.I)
+_NOISE_DOMAINS = {
+    "gmail", "outlook", "google", "microsoft", "gits", "screenmind",
+    "yahoo", "hotmail", "office", "office365", "live", "icloud",
+    "proton", "localhost", "example", "aka", "hubspot", "hubspotlinks",
+    "threatlocker", "splunk", "eurodns", "learn",
+    # OCR manglings of "gits" seen in captures
+    "gils", "glts", "g1ts",
+}
+# Window titles that are never billable work
+_NOISE_TITLE_RE = re.compile(
+    r"lock\s*screen|screenmind|program manager|"
+    r"mercedes|mobile\.de|autoscout|youtube|netflix|amazon",
+    re.I,
+)
+_DOMAIN_IN_TITLE_RE = re.compile(
+    r"\b([a-z][a-z0-9-]{2,30})\.(?:com|net|org|lu|fr|de|io)\b", re.I
+)
+_CAPS_NAME_RE = re.compile(r"\b([A-Z][A-Z][A-Z0-9-]{2,25})\b")
+_CAPS_NOISE = {
+    "GITS", "PSF", "SOC", "O365", "PDF", "HTML", "URL", "HTTP", "HTTPS",
+    "SSL", "DNS", "VPN", "USB", "CSV", "XML", "JSON", "API", "IT", "AD",
+    "FSLOGIX", "CIPP", "AZURE", "POWERSHELL", "INCIDENT", "REPORT",
+    "READ", "ONLY", "WORD", "EXCEL", "OUTLOOK", "TEAMS", "CHROME",
+    "GOOGLE", "MICROSOFT", "WINDOWS", "DESKTOP", "VIEWER", "BASTION",
+    "MGT", "MANAGEMENT", "SHAREPOINT", "PERMISSIONS", "VBILOKOBYLSKYI",
+    "DPERILLEUX", "PS1", "DOCX", "XLSX", "PPTX", "PSM1", "GLOBAL",
+    "SERVICES", "STANDARDS", "HIGH", "SECURITY", "DRIFT", "CLONE",
+    "REMEDI", "ERROR", "CLARIFICATION", "FILTER", "BOOK1", "V2", "V1",
+    "XA", "DG5017", "ELEA", "WORK", "REVIEW", "MY", "TICKETS", "HELPDESK",
+    "CALENDAR", "CLIENTS", "ASSETS", "DASHBOARD", "GROUP", "XVANTAGE",
+    # internal infrastructure / session hosts, not customers
+    "GITSMGMT", "DG5017", "BASTION", "XA", "FSLOGIX", "MGT",
+}
+
+
+def _customer_from_text(text: str) -> str:
+    """Best-effort customer name from screen text. Email domains are the
+    strongest signal; OCR-mangled 'name com' patterns are the fallback.
+    Returns '' when nothing identifies a customer."""
+    email_domains = []
+    for d in re.findall(r"[\w.-]+@([\w-]+(?:\.[\w-]+)+)", text):
+        email_domains.append(d.lower().split(".")[0])
+    for d in email_domains:
+        if not any(n in d for n in _NOISE_DOMAINS) and len(d) >= 3:
+            return d
+    for d in re.findall(
+        r"\b([a-z][a-z0-9-]{2,30})[_ ](?:com|net|org|lu|fr|de|io)\b",
+        text.lower(),
+    ):
+        if not any(n in d for n in _NOISE_DOMAINS) and len(d) >= 3:
+            return d
+    return ""
+
+
+def _parse_iso(v):
+    try:
+        return datetime.fromisoformat(str(v))
+    except (ValueError, TypeError):
+        return None
+
+
+def _span_minutes(ts_list, interval: int) -> int:
+    """Time on task from capture timestamps: first capture counts one
+    interval, each gap counts up to 2x interval (same method as the
+    daily summary). Rounded to 5 minutes, minimum 5."""
+    if not ts_list:
+        return 0
+    total = float(interval)
+    for prev, cur in zip(ts_list, ts_list[1:]):
+        gap = (cur - prev).total_seconds()
+        if gap > 0:
+            total += min(gap, 2 * interval)
+    return max(5, int(round(total / 60.0 / 5.0)) * 5)
+
+
+def _fmt_dur(minutes: int) -> str:
+    return f"{minutes} min" if minutes < 60 else f"{minutes // 60}:{minutes % 60:02d} h"
+
+
+def _lev(a: str, b: str) -> int:
+    """Small Levenshtein for typo-tolerant customer merging."""
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _normalize_title(title: str) -> str:
+    """Reduce a window title to a stable grouping key: strip app suffixes,
+    file extensions, and collapse whitespace."""
+    t = title.strip()
+    # App suffixes like " - Google Chrome", " - Word", " - Outlook"
+    t = re.sub(r"\s+[-–]\s+(Google Chrome|Mozilla Firefox|Word|Excel|Outlook|"
+               r"PowerPoint|Visual Studio Code|Notepad|Microsoft Teams).*$", "", t, flags=re.I)
+    # File extensions
+    t = re.sub(r"\.(docx?|xlsx?|pptx?|ps1|psm1|pdf|txt|csv|md)\b", "", t, flags=re.I)
+    return " ".join(t.split())
+
+
+def _customer_from_title(title: str) -> str:
+    """Customer from a window title: domain (users - engelwoodgroup.com) or
+    an ALL-CAPS company token (INCIDENT REPORT - ATDOMCO - O365 ...)."""
+    for m in _DOMAIN_IN_TITLE_RE.finditer(title):
+        name = m.group(1).lower()
+        if name not in _NOISE_DOMAINS and len(name) >= 3:
+            return name
+    for m in _CAPS_NAME_RE.finditer(title):
+        tok = m.group(1)
+        if tok.isdigit():
+            continue
+        # Split hyphenated tokens: GITSMGMT-XA is infra, not a customer
+        parts = tok.split("-")
+        if all(p in _CAPS_NOISE or len(p) < 2 for p in parts):
+            continue
+        if tok in _CAPS_NOISE:
+            continue
+        return tok.lower()
+    return ""
+
+
+def _preset_subject(title: str, app: str) -> str:
+    """Deterministic subject for well-known window patterns; '' otherwise."""
+    app_low = (app or "").lower()
+    t = title
+    if "inbox" in t.lower() or "sent items" in t.lower():
+        return "Email (inbox/sent)"
+    m = re.search(r"\|\s*([^|]+?)\s*channel\s*\|", t, re.I)
+    if m:
+        return f"Teams: {m.group(1).strip()}"
+    # Remote-desktop windows (Citrix/Desktop Viewer): the hostname in the
+    # title is NOT a task. No preset here — the LLM classifies from OCR,
+    # and unclassifiable sessions are folded into one "Remote
+    # administration" line in _run_timesheet_mode.
+    if re.search(r"\belea\b", t, re.I):
+        return "ELEA time/management"
+    if re.search(r"\bwork\s*review\b", t, re.I):
+        return "Work review"
+    return ""
+
+_EDITOR_SUFFIX_RE = re.compile(
+    r"\s+[-–]\s+(?:Visual Studio Code|Word|Excel|PowerPoint|Notepad\+\+|"
+    r"PowerShell ISE|ISE|Sublime Text|Notepad|Read-Only)\s*$", re.I,
+)
+_GENERIC_SEGMENTS = {
+    "users", "inbox", "sent items", "home", "dashboard", "new tab",
+    "untitled", "welcome", "chat", "calendar",
+}
+
+
+def _fallback_subject(title: str) -> str:
+    """Last-resort subject from the window title itself: the active
+    document/file segment. 'SplunkInstall.ps1 - Sharepoint Permissions -
+    Visual Studio Code' -> 'SplunkInstall' (the open file is the task,
+    not the whole composite title)."""
+    t = title.strip()
+    for _ in range(3):  # peel trailing app/state suffixes
+        t2 = _EDITOR_SUFFIX_RE.sub("", t)
+        if t2 == t:
+            break
+        t = t2
+    for seg in re.split(r"\s+[-–]\s+", t):
+        seg = seg.strip()
+        if len(seg) < 3 or seg.lower() in _GENERIC_SEGMENTS:
+            continue
+        seg = re.sub(
+            r"\.(docx?|xlsx?|pptx?|ps1|psm1|pdf|txt|csv|md|py|js|ts)\b",
+            "", seg, flags=re.I,
+        )
+        seg = " ".join(seg.split())
+        if len(seg) >= 3:
+            return seg[:60]
+    return ""
+
+
+def _aggregate_timesheet(analyzed: list, interval: int):
+    """Split the day's captures into helpdesk-ticket work (window title
+    'Ticket NNNNN') and other work grouped by normalized window title.
+
+    Returns (tickets, other):
+      tickets: [{"num", "minutes", "customer", "texts": [..]}]
+      other:   [{"title", "minutes", "customer", "subject", "texts": [..]}]
+    """
+    chrono = []
+    for a in analyzed:
+        ts = _parse_iso(a.get("timestamp"))
+        if ts:
+            chrono.append((ts, a))
+    chrono.sort(key=lambda x: x[0])
+
+    tickets = {}
+    other = {}
+    for ts, a in chrono:
+        title = a.get("window_title") or ""
+        m = _TICKET_NUM_RE.search(title)
+        if m:
+            num = m.group(1)
+            entry = tickets.setdefault(num, {"times": [], "texts": [], "customer": "", "_seen": set()})
+            entry["times"].append(ts)
+            text = (a.get("organized_text") or a.get("ocr_text") or "").strip()
+            if text:
+                key = text[:80]
+                if key not in entry["_seen"] and len(entry["texts"]) < 10:
+                    entry["_seen"].add(key)
+                    entry["texts"].append(" ".join(text.split())[:600])
+                if not entry["customer"]:
+                    entry["customer"] = _customer_from_text(text)
+        else:
+            if not title.strip() or _NOISE_TITLE_RE.search(title):
+                continue
+            key = _normalize_title(title)[:80]
+            app_low = (a.get("app_name") or "").lower()
+            entry = other.setdefault(
+                key,
+                {"times": [], "title": key, "app": a.get("app_name") or "?",
+                 "customer": "", "texts": [], "_seen": set(),
+                 "remote": "desktop viewer" in key.lower() or "citrix" in app_low},
+            )
+            entry["times"].append(ts)
+            if not entry["customer"]:
+                entry["customer"] = _customer_from_title(title)
+            text = (a.get("organized_text") or a.get("ocr_text") or "").strip()
+            if text:
+                tkey = text[:80]
+                if tkey not in entry["_seen"] and len(entry["texts"]) < 10:
+                    entry["_seen"].add(tkey)
+                    entry["texts"].append(" ".join(text.split())[:600])
+
+    ticket_rows = []
+    for num, entry in tickets.items():
+        ticket_rows.append({
+            "num": num,
+            "minutes": _span_minutes(entry["times"], interval),
+            "customer": (entry["customer"] or "—").upper().replace("-", " "),
+            "texts": entry["texts"],
+        })
+    ticket_rows.sort(key=lambda t: t["minutes"], reverse=True)
+
+    other_rows = []
+    for entry in other.values():
+        minutes = _span_minutes(entry["times"], interval)
+        if minutes < 5:
+            continue
+        subject = _preset_subject(entry["title"], entry["app"])
+        other_rows.append({
+            "title": entry["title"],
+            "minutes": minutes,
+            "customer": (entry["customer"] or "—").upper().replace("-", " "),
+            "subject": subject,
+            "texts": entry["texts"],
+        })
+    other_rows.sort(key=lambda r: r["minutes"], reverse=True)
+
+    return ticket_rows, other_rows[:15]
+
+
+def _run_timesheet_mode(agent: dict, date: str | None = None) -> str:
+    """Timesheet agent: deterministic aggregation (ticket numbers, times,
+    grouping, sorting, subtotals) + one LLM call that classifies every
+    session — customer, subject, and a screen-evidence justification —
+    from its real screen text.
+
+    The model's context window is filled with screen text, budgeted
+    proportionally to time spent per session. Small local models drift on
+    format, so anything format-critical stays in code.
+
+    `date` (YYYY-MM-DD) overrides "today" for backfill runs."""
+    from screenmind.engine import llm_client
+    from screenmind.storage.database import Database
+
+    target_date = date or str(datetime.now().date())
+    db = Database()
+    try:
+        activities = db.get_activities_by_date(target_date, limit=2000)
+    finally:
+        db.close()
+    analyzed = [a for a in activities if a.get("analyzed")]
+    tickets, other = _aggregate_timesheet(analyzed, settings.capture_interval)
+    if not tickets and not other:
+        return f"No ticket activity found for {target_date}."
+
+    # ── Classification digest: fill the context window with screen text ──
+    sessions = []
+    for t in tickets:
+        sessions.append({
+            "id": f"T{t['num']}", "kind": "ticket",
+            "label": f"helpdesk ticket {t['num']}",
+            "minutes": t["minutes"], "texts": t["texts"], "row": t,
+        })
+    for i, o in enumerate(other, 1):
+        sessions.append({
+            "id": f"O{i}", "kind": "other",
+            "label": f"window: {o['title']}",
+            "minutes": o["minutes"], "texts": o["texts"], "row": o,
+        })
+
+    window = llm_client.text_model_window() or settings.context_window
+    # Reserve framing (~800 tokens) + output (~45 tokens per session + margin)
+    out_tokens = max(512, len(sessions) * 45 + 128)
+    budget_chars = max(2000, (window - 800 - out_tokens) * 4)
+    total_min = sum(s["minutes"] for s in sessions) or 1
+
+    blocks = []
+    used = 0
+    for s in sessions:
+        share = max(300, int(budget_chars * s["minutes"] / total_min))
+        body = "\n".join(s["texts"])[:share] or "(no screen text captured)"
+        header = f"== {s['id']} | {s['label']} | {_fmt_dur(s['minutes'])} =="
+        if blocks and used + len(header) + len(body) > budget_chars:
+            body = "(text omitted — budget exhausted)"
+        blocks.append(f"{header}\n{body}")
+        used += len(header) + len(body) + 1
+
+    prompt = (
+        f"A user worked on the tasks below on {target_date}. Each block shows "
+        "what was on their screen during that task (OCR text, may be garbled).\n"
+        "For EACH block write exactly one line:\n"
+        "ID | CUSTOMER | SUBJECT | JUSTIFICATION\n"
+        "- ID: the block id (T99177, O1, ...)\n"
+        "- CUSTOMER: the client/company this work was for — infer from email "
+        'domains, company names, document names in the text; "—" if unknown\n'
+        '- SUBJECT: what was done, max 8 words; "—" if unclear\n'
+        "- JUSTIFICATION: one short sentence (max 15 words) naming the concrete "
+        "on-screen evidence for this work — the document, error, request, email "
+        'thread or system visible in the text; "—" if nothing specific is visible\n'
+        "- Titles like 'HOSTNAME - Desktop Viewer' are remote-desktop "
+        "sessions, NOT tasks — say what was done inside, from the screen text\n"
+        "No other text.\n\n" + "\n\n".join(blocks)
+    )
+
+    classified = {}  # id -> (customer, subject, justification)
+    try:
+        raw = llm_client.generate(
+            prompt=prompt,
+            temperature=agent.get("_temperature", 0.1),
+            max_tokens=out_tokens,
+        )
+        known = {s["id"] for s in sessions}
+        for line in raw.splitlines():
+            m = re.match(
+                r"\s*(T\d{4,6}|O\d+)\s*\|\s*([^|]*)\|\s*([^|]*)\|?\s*(.*)$", line
+            )
+            if m and m.group(1) in known:
+                # 3-field answers (no justification) still parse: group(4) == ""
+                classified[m.group(1)] = (
+                    m.group(2).strip()[:40],
+                    m.group(3).strip(),
+                    m.group(4).strip(),
+                )
+    except Exception:
+        pass  # fall back to code-only classification below
+
+    # ── Merge: code-derived facts win; the model fills the gaps ──
+    def _clean(subj):
+        subj = (subj or "").strip().strip("|").strip()
+        if not subj or subj.startswith("—") or subj.lower() in (
+            "unknown", "n/a", "no inferable subject",
+        ):
+            return ""
+        return subj[:60]
+
+    def _clean_just(j):
+        """Justification line: drop placeholders, cap length."""
+        j = (j or "").strip().strip("|").strip()
+        if not j or j.startswith("—") or j.lower() in ("unknown", "n/a"):
+            return ""
+        return j[:140]
+
+    groups = {}
+    remote_fb = 0  # minutes of remote sessions the LLM couldn't classify
+    for s in sessions:
+        row = s["row"]
+        m_cust, m_subj, m_just = classified.get(s["id"], ("", "", ""))
+        m_cust = (m_cust or "").upper().replace("-", " ").strip()
+        if m_cust in ("", "—", "UNKNOWN"):
+            m_cust = ""
+        # Reject model-suggested "customers" that are just infra/app tokens
+        if m_cust and all(
+            tok in _CAPS_NOISE or len(tok) < 2 for tok in m_cust.split()
+        ):
+            m_cust = ""
+        just = _clean_just(m_just)
+        if s["kind"] == "ticket":
+            customer = row["customer"] if row["customer"] != "—" else (m_cust or "—")
+            subject = _clean(m_subj) or "—"
+            ticket_label = f"Ticket {row['num']}"
+        else:
+            customer = row["customer"] if row["customer"] != "—" else (m_cust or "—")
+            if row.get("remote") and not _clean(m_subj):
+                # Hostname of a remote session is not a task; if the screen
+                # text doesn't reveal the work, fold into one summary line.
+                remote_fb += row["minutes"]
+                continue
+            preset = row["subject"] or ""
+            subject = (
+                preset if preset and preset != "—"
+                else _clean(m_subj) or _fallback_subject(row["title"]) or "—"
+            )
+            ticket_label = "—"
+        groups.setdefault(customer, []).append(
+            (ticket_label, subject, row["minutes"], just))
+
+    if remote_fb:
+        groups.setdefault("—", []).append(
+            ("—", "Remote administration (Citrix)", remote_fb, ""))
+
+    # Merge near-duplicate customers ("OMEA ADVISORS" vs "OMEA ADVISORS SARL")
+    merged = {}
+    for cust, rows in groups.items():
+        target = cust
+        old_key = None
+        for existing in list(merged.keys()):
+            if cust == "—" or existing == "—":
+                continue
+            near = cust.startswith(existing) or existing.startswith(cust)
+            if not near:
+                # OCR typos: ENGELWVOODGROUP vs ENGELWOODGROUP
+                d = _lev(cust, existing)
+                near = (d <= 1 and min(len(cust), len(existing)) >= 6) or (
+                    d <= 2 and min(len(cust), len(existing)) >= 10
+                )
+            if near:
+                target = cust if len(cust) < len(existing) else existing
+                old_key = existing if existing != target else None
+                break
+        merged.setdefault(target, []).extend(rows)
+        if old_key and old_key in merged and old_key != target:
+            merged[target].extend(merged.pop(old_key))
+    groups = merged
+
+    ordered = sorted(
+        groups.items(),
+        key=lambda kv: (kv[0] == "—", -sum(r[2] for r in kv[1])),
+    )
+    out = []
+    for cust, rows in ordered:
+        out.append(cust)
+        for ticket, subj, minutes, just in sorted(
+            rows, key=lambda r: r[2], reverse=True
+        ):
+            out.append(f"{ticket} | {cust} | {subj} | {_fmt_dur(minutes)}")
+            if just:
+                out.append(f"    because: {just}")
+        out.append(f"Subtotal: {_fmt_dur(sum(r[2] for r in rows))}")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 def _run_markdown_agent(agent: dict) -> str:
     """Execute a markdown agent by calling Gemma with injected screen data.
 
@@ -294,19 +770,26 @@ def _run_markdown_agent(agent: dict) -> str:
     from screenmind.engine import llm_client
     from collections import Counter
 
+    # Special output modes own their entire pipeline (data + format).
+    if agent.get("mode", "").strip().lower() == "timesheet":
+        return _run_timesheet_mode(agent, date=agent.get("_run_date"))
+
     # Determine which data sections the agent wants
     requested = agent.get("_data_sections", {"timeline", "apps"})
     model_req = agent.get("_model_req", 0)
 
     # Adaptive budget based on model context window
     ctx_window = settings.context_window
-    available_tokens = ctx_window - 800 - 1000  # reserve for system + output
-    budget = min(max(available_tokens * 4, 800), 12000)  # chars, floor 800, cap 12k
+    available_tokens = ctx_window - 800 - 2048  # reserve for system + output
+    # OCR agents need many captures to cover a full day — let them use the
+    # whole token-derived budget; summary-style agents stay capped at 12k.
+    chars = max(available_tokens * 4, 800)
+    budget = chars if "ocr" in requested else min(chars, 12000)
 
     # Get recent activities for context
     from screenmind.storage.database import Database
     db = Database()
-    activities = db.get_activities_by_date(str(datetime.now().date()), limit=200)
+    activities = db.get_activities_by_date(str(datetime.now().date()), limit=2000)
 
     # Pre-compute stats from activities
     analyzed = [a for a in activities if a.get("analyzed")]
@@ -388,13 +871,128 @@ def _run_markdown_agent(agent: dict) -> str:
             s = f"### Mood Breakdown\n{mood_str}"
             sections.append(s)
             remaining -= len(s)
+    # Screen-activity section for timesheet-style agents.
+    # Ticket work is aggregated per ticket number (all captures for a ticket
+    # merged across the day, with total time + a screen-text sample for
+    # customer/subject context). Everything else is compressed into a short
+    # per-app summary. Keeps the payload small and free of repeated lines,
+    # which small local models handle much better than raw capture lists.
+    if "ocr" in requested and remaining > 100:
+        interval = settings.capture_interval
+        ticket_num_re = re.compile(r"ticket\s+(\d{4,6})", re.I)
+        # Domain fragments that never identify a customer (free mail, vendors, OCR noise)
+        _noise_domains = {
+            "gmail", "outlook", "google", "microsoft", "gits", "screenmind",
+            "yahoo", "hotmail", "office", "office365", "live", "icloud",
+            "proton", "localhost", "example",
+        }
+
+        def _customer_from_text(text):
+            """Best-effort customer name from screen text: email domains and
+            OCR-mangled 'name com' patterns. Returns '' when nothing found."""
+            found = []
+            for d in re.findall(r"[\w.-]+@([\w-]+(?:\.[\w-]+)+)", text):
+                found.append(d.lower().split(".")[0])
+            for d in re.findall(
+                r"\b([a-z][a-z0-9-]{2,30})[_ ](?:com|net|org|lu|fr|de|io)\b",
+                text.lower(),
+            ):
+                found.append(d)
+            for d in found:
+                if not any(n in d for n in _noise_domains) and len(d) >= 3:
+                    return d
+            return ""
+
+        def _parse_iso(v):
+            try:
+                return datetime.fromisoformat(str(v))
+            except (ValueError, TypeError):
+                return None
+
+        def _span_minutes(ts_list):
+            if not ts_list:
+                return 0
+            total = float(interval)
+            for prev, cur in zip(ts_list, ts_list[1:]):
+                gap = (cur - prev).total_seconds()
+                if gap > 0:
+                    total += min(gap, 2 * interval)
+            return max(1, int(round(total / 60.0)))
+
+        chrono = []
+        for a in analyzed:
+            ts = _parse_iso(a.get("timestamp"))
+            if ts:
+                chrono.append((ts, a))
+        chrono.sort(key=lambda x: x[0])  # oldest first
+
+        tickets = {}   # ticket number -> {"times": [], "texts": [], "customer": ""}
+        other_app = {} # app_name -> [datetime]
+        for ts, a in chrono:
+            title = a.get("window_title") or ""
+            m = ticket_num_re.search(title)
+            if m:
+                num = m.group(1)
+                entry = tickets.setdefault(num, {"times": [], "texts": [], "customer": ""})
+                entry["times"].append(ts)
+                text = (a.get("organized_text") or a.get("ocr_text") or "").strip()
+                if text and len(entry["texts"]) < 3:
+                    entry["texts"].append(" ".join(text.split())[:160])
+                if text and not entry["customer"]:
+                    entry["customer"] = _customer_from_text(text)
+            else:
+                app = a.get("app_name") or "?"
+                app = re.sub(r"[^a-z0-9]", "", app.lower()) or "?"
+                other_app.setdefault(app, []).append(ts)
+
+        def _fmt_dur(minutes):
+            return f"{minutes} min" if minutes < 60 else f"{minutes // 60}:{minutes % 60:02d} h"
+
+        lines = []
+        if tickets:
+            # Pre-grouped timesheet template: customer headers, per-ticket
+            # lines sorted longest-first, and subtotals are all computed
+            # here — the model only fills the SUBJECT blanks.
+            lines.append("TIMESHEET TEMPLATE — fill each ??? with a short subject:")
+            groups = {}
+            for num, entry in tickets.items():
+                cust = (entry["customer"] or "—").upper()
+                minutes = max(5, int(round(_span_minutes(entry["times"]) / 5.0)) * 5)
+                groups.setdefault(cust, []).append((num, minutes, entry))
+            for cust, rows in sorted(
+                groups.items(),
+                key=lambda kv: sum(m for _, m, _ in kv[1]),
+                reverse=True,
+            ):
+                lines.append(cust)
+                for num, minutes, entry in sorted(rows, key=lambda r: r[1], reverse=True):
+                    lines.append(f"Ticket {num} | {cust} | ??? | {_fmt_dur(minutes)}")
+                    if entry["texts"]:
+                        lines.append(f"    screen text: {entry['texts'][0]}")
+                lines.append(f"Subtotal: {_fmt_dur(sum(m for _, m, _ in rows))}")
+                lines.append("")
+
+        if other_app:
+            lines.append("Other activity (no helpdesk ticket):")
+            for app, times in sorted(other_app.items(), key=lambda kv: _span_minutes(kv[1]), reverse=True)[:12]:
+                minutes = _span_minutes(times)
+                dur = f"{minutes} min" if minutes < 60 else f"{minutes // 60}:{minutes % 60:02d} h"
+                lines.append(f"- {app}: {times[0].strftime('%H:%M')}-{times[-1].strftime('%H:%M')}, ~{dur}")
+
+        if lines:
+            s = (
+                f"### Screen Activity Summary ({len(tickets)} helpdesk tickets)\n"
+                f"(time estimated from capture spans; captures every ~{interval}s)\n"
+                + "\n".join(lines)
+            )
+            sections.append(s)
 
     # Timeline section — fills remaining budget
     if "timeline" in requested and remaining > 80:
         max_items = max(remaining // 80, 3)  # ~80 chars per line
         timeline_lines = []
         for a in analyzed[:max_items]:
-            ts = a.get("timestamp", "")[-8:-3]  # HH:MM
+            ts = _hhmm(a.get("timestamp", ""))
             app = a.get("app_name", "?")
             cat = a.get("category", "?")
             summary = (a.get("summary") or "")[:60]
@@ -437,21 +1035,23 @@ The user has set up this agent with the following instructions:
 
 ---
 
-Now execute the agent's instructions based on this data. Be specific, actionable, and reference actual apps/activities."""
+Now execute the agent's instructions based on this data. Follow the agent's output format exactly."""
 
     try:
         result = llm_client.generate(
             prompt=prompt,
-            temperature=0.3,
-            max_tokens=1024,
+            temperature=agent.get("_temperature", 0.3),
+            max_tokens=2048,
         )
         return upgrade_hint + result if upgrade_hint else result
     except Exception as e:
         raise RuntimeError(f"Gemma call failed: {e}")
 
 
-def _run_python_plugin(agent: dict) -> str:
-    """Execute a Python plugin by importing and calling run()."""
+def _run_python_plugin(agent: dict, date: str | None = None) -> str:
+    """Execute a Python plugin by importing and calling run().
+    `date` (YYYY-MM-DD) is forwarded to the plugin via context["date"]
+    for backfill runs; plugins that don't support it ignore it."""
     filepath = agent["filepath"]
 
     # Security: check if approved
@@ -477,6 +1077,8 @@ def _run_python_plugin(agent: dict) -> str:
         "timestamp": datetime.utcnow().isoformat(),
         "data_dir": str(settings.data_path),
     }
+    if date:
+        context["date"] = date
 
     # Set SDK agent context before running (for state functions)
     screenmind.screenmind_sdk._set_current_agent(sanitized_name)
@@ -489,17 +1091,19 @@ def _run_python_plugin(agent: dict) -> str:
     return str(result) if result else "Plugin completed (no output)"
 
 
-def run_agent(agent: dict) -> dict:
-    """Run a single agent and return result dict."""
+def run_agent(agent: dict, date: str | None = None) -> dict:
+    """Run a single agent and return result dict. `date` (YYYY-MM-DD)
+    overrides "today" for modes that support it (timesheet)."""
     start = time.time()
     name = agent["name"]
     agent_type = agent["type"]
 
     try:
         if agent_type == "markdown":
+            agent = {**agent, "_run_date": date}
             output = _run_markdown_agent(agent)
         elif agent_type == "python":
-            output = _run_python_plugin(agent)
+            output = _run_python_plugin(agent, date=date)
         else:
             output = f"Unknown agent type: {agent_type}"
 

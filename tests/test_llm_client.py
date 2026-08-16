@@ -494,6 +494,11 @@ class TestTextModelRouting:
         mock_settings.text_llm_routing = routing
         mock_settings.text_llm_context_window = text_window
         mock_settings.context_window = context_window
+        mock_settings.vision_llm_enabled = False
+        mock_settings.vision_llm_model_name = None
+        mock_settings.vision_llm_api_base_url = ""
+        mock_settings.vision_llm_api_key = None
+        mock_settings.vision_llm_context_window = 32768
 
     def _chat_ok(self, mock_client_cls):
         mock_resp = MagicMock()
@@ -645,3 +650,148 @@ class TestTextModelRouting:
         mock_settings.text_llm_context_window = 32768
         from screenmind.engine.llm_client import _route_to_text_model
         assert _route_to_text_model([{"role": "user", "content": "x" * 20000}], 2048) is False
+
+
+class TestVisionModelRouting:
+    """Dedicated vision model handles image requests on its own endpoint."""
+
+    def _mock_settings(self, mock_settings, enabled=True, vision_model="vision-model",
+                       vision_url="", vision_key=None):
+        mock_settings.gemma_mode = "custom"
+        mock_settings.llm_api_base_url = "http://api.test/v1"
+        mock_settings.llm_api_key = None
+        mock_settings.llm_model_name = "primary-model"
+        mock_settings.text_llm_model_name = None
+        mock_settings.text_llm_routing = "off"
+        mock_settings.text_llm_api_base_url = ""
+        mock_settings.text_llm_context_window = 32768
+        mock_settings.context_window = 6144
+        mock_settings.vision_llm_enabled = enabled
+        mock_settings.vision_llm_model_name = vision_model
+        mock_settings.vision_llm_api_base_url = vision_url
+        mock_settings.vision_llm_api_key = vision_key
+        mock_settings.vision_llm_context_window = 32768
+
+    def _chat_ok(self, mock_client_cls):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+
+    def _image_messages(self):
+        return [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+        ]}]
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_image_routes_to_vision_model(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings)
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "vision-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_text_stays_on_primary_when_vision_enabled(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings)
+        self._chat_ok(mock_client_cls)
+        chat([{"role": "user", "content": "short"}], max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_toggle_off_keeps_images_on_primary(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, enabled=False)
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_empty_model_name_keeps_images_on_primary(self, mock_client_cls, mock_settings):
+        self._mock_settings(mock_settings, vision_model="")
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        payload = mock_client_cls.return_value.post.call_args[1]["json"]
+        assert payload["model"] == "primary-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_vision_model_uses_own_endpoint_url_and_key(self, mock_client_cls, mock_settings):
+        """A configured vision endpoint gets its own URL and its own key."""
+        self._mock_settings(mock_settings, vision_url="http://vision.test/v1/",
+                            vision_key="sk-vision")
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://vision.test/v1/chat/completions"
+        assert call_args[1]["json"]["model"] == "vision-model"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-vision"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_vision_model_on_shared_endpoint_reuses_primary_key(self, mock_client_cls, mock_settings):
+        """Empty vision URL rides the primary endpoint — primary key applies."""
+        self._mock_settings(mock_settings)
+        mock_settings.llm_api_key = "sk-primary"
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://api.test/v1/chat/completions"
+        assert call_args[1]["headers"] == {"Authorization": "Bearer sk-primary"}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_vision_own_endpoint_without_key_sends_no_auth(self, mock_client_cls, mock_settings):
+        """The primary key is never forwarded to a different endpoint."""
+        self._mock_settings(mock_settings, vision_url="http://vision.test/v1")
+        mock_settings.llm_api_key = "sk-primary"
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[1]["headers"] == {}
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_local_primary_with_own_vision_url_routes(self, mock_client_cls, mock_settings):
+        """Local llama-server primary + dedicated vision endpoint → routing works."""
+        self._mock_settings(mock_settings, vision_url="http://vision.test/v1")
+        mock_settings.gemma_mode = "local"
+        mock_settings.llama_server_host = "http://127.0.0.1:5809"
+        self._chat_ok(mock_client_cls)
+        chat(self._image_messages(), max_tokens=64)
+        call_args = mock_client_cls.return_value.post.call_args
+        assert call_args[0][0] == "http://vision.test/v1/chat/completions"
+        assert call_args[1]["json"]["model"] == "vision-model"
+
+    @patch("screenmind.engine.llm_client.settings")
+    def test_local_primary_without_vision_url_never_routes(self, mock_settings):
+        """llama-server serves one model — without a vision URL there is
+        nowhere to route to."""
+        mock_settings.gemma_mode = "local"
+        mock_settings.vision_llm_enabled = True
+        mock_settings.vision_llm_api_base_url = ""
+        mock_settings.vision_llm_api_key = None
+        mock_settings.vision_llm_model_name = "vision-model"
+        mock_settings.vision_llm_context_window = 32768
+        from screenmind.engine.llm_client import _route_to_vision_model
+        assert _route_to_vision_model(self._image_messages()) is False
+
+    @patch("screenmind.engine.llm_client.settings")
+    def test_vision_model_window_reflects_toggle(self, mock_settings):
+        """vision_model_window() is None while disabled, the configured
+        window while enabled."""
+        from screenmind.engine.llm_client import vision_model_window
+        mock_settings.gemma_mode = "custom"
+        mock_settings.vision_llm_model_name = "vision-model"
+        mock_settings.vision_llm_api_base_url = "http://vision.test/v1"
+        mock_settings.vision_llm_context_window = 65536
+        mock_settings.vision_llm_enabled = True
+        assert vision_model_window() == 65536
+        mock_settings.vision_llm_enabled = False
+        assert vision_model_window() is None

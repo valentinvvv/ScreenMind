@@ -198,6 +198,59 @@ def _route_to_text_model(messages: list, max_tokens: int) -> bool:
     return est_tokens + max_tokens > settings.context_window
 
 
+def _has_images(messages: list) -> bool:
+    """True when any message carries image_url content parts."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("type") == "image_url" for p in content
+        ):
+            return True
+    return False
+
+
+def _vision_model_configured() -> bool:
+    """Vision routing needs the toggle, a model name, and a reachable endpoint:
+    either its own OpenAI-compatible URL or the primary custom endpoint."""
+    if not settings.vision_llm_enabled:
+        return False
+    if not (settings.vision_llm_model_name or "").strip():
+        return False
+    return bool((settings.vision_llm_api_base_url or "").strip()) or _is_custom_backend()
+
+
+def _vision_base_url() -> str:
+    """Base URL of the vision-model endpoint (falls back to the primary endpoint)."""
+    url = (settings.vision_llm_api_base_url or "").strip()
+    return url.rstrip("/") if url else _base_url()
+
+
+def _vision_auth_headers() -> dict:
+    """Authorization header for the vision endpoint.
+    Own key wins; while sharing the primary endpoint the primary key applies;
+    a dedicated endpoint never receives the primary key."""
+    key = (settings.vision_llm_api_key or "").strip()
+    if key:
+        return {"Authorization": f"Bearer {key}"}
+    if not (settings.vision_llm_api_base_url or "").strip():
+        return _auth_headers()
+    return {}
+
+
+def vision_model_window() -> Optional[int]:
+    """Context window of the configured vision model, or None when routing is
+    unavailable (toggle off, model unset, or no reachable endpoint)."""
+    if not _vision_model_configured():
+        return None
+    return settings.vision_llm_context_window
+
+
+def _route_to_vision_model(messages: list) -> bool:
+    """Decide whether this request goes to the dedicated vision model.
+    Only requests containing images route there; audio stays on the primary."""
+    return _vision_model_configured() and _has_images(messages)
+
+
 def chat(
     messages: list,
     temperature: float = 0.1,
@@ -225,11 +278,16 @@ def chat(
     _cancel_event.clear()
 
     use_text_model = _route_to_text_model(messages, max_tokens)
+    use_vision_model = not use_text_model and _route_to_vision_model(messages)
     if use_text_model:
         # The text model is always addressed as an OpenAI-compatible endpoint,
         # even when the primary backend is the local llama-server.
         url = f"{_text_base_url()}/chat/completions"
         headers = _text_auth_headers()
+    elif use_vision_model:
+        # Same rule for the dedicated vision model.
+        url = f"{_vision_base_url()}/chat/completions"
+        headers = _vision_auth_headers()
     else:
         url = (
             f"{_base_url()}/chat/completions"
@@ -242,10 +300,12 @@ def chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if use_text_model or _is_custom_backend():
+    if use_text_model or use_vision_model or _is_custom_backend():
         # OpenAI-compatible APIs require the model identifier in the payload
         payload["model"] = (
-            settings.text_llm_model_name if use_text_model else settings.llm_model_name
+            settings.text_llm_model_name if use_text_model
+            else settings.vision_llm_model_name if use_vision_model
+            else settings.llm_model_name
         )
     if use_text_model:
         # Reasoning models (Qwen3, DeepSeek-R1, ...) spend max_tokens on hidden

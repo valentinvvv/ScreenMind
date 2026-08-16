@@ -79,6 +79,7 @@ Control what screen data your markdown agent receives:
 | `urls` | URLs visited (from browser address bar) | Web usage tracking |
 | `meetings` | Meeting summaries and durations | Meeting intelligence |
 | `mood` | Mood/sentiment breakdown from screen analysis | Wellbeing tracking |
+| `ocr` | Raw screen text per capture (chronological, budget-sampled) | Ticket extraction, timesheets, exact-content tasks |
 
 **Example combinations:**
 ```yaml
@@ -86,6 +87,7 @@ data: urls, timeline          # AI tool tracking, research logging
 data: apps, timeline          # Time tracking, productivity reports
 data: meetings, timeline      # Meeting follow-ups, action items
 data: urls, apps, meetings, mood, timeline  # Everything (needs larger model)
+data: ocr, timeline, urls     # Raw screen text — timesheets, ticket tracking
 ```
 
 The data budget scales with your model's context window. Smaller models get fewer items per section. If your agent needs rich data, add `model_requirement: 8192` and users with smaller models will see an upgrade suggestion.

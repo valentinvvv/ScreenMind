@@ -107,6 +107,7 @@ screenmind = [
     "api/static/js/*",
     "api/static/index.html",
     "default_agents/*.md",
+    "default_agents/*.py",
     "assets/*",
 ]
 

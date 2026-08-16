@@ -119,6 +119,8 @@ async def toggle_agent(name: str, request: Request):
 async def run_agent_now(name: str, request: Request):
     """Trigger an immediate agent run.
     Python agents require approval OR X-Confirm header.
+    Optional JSON body {"date": "YYYY-MM-DD"} overrides "today" for
+    modes that support it (timesheet backfill).
     """
     from screenmind.engine.agent_runner import discover_agents, run_agent, _approved_plugins
     agents = discover_agents()
@@ -129,7 +131,14 @@ async def run_agent_now(name: str, request: Request):
                 if a.get("filepath", "") not in _approved_plugins:
                     if request.headers.get("X-Confirm") != "true":
                         return {"status": "error", "error": "Python agent not approved. Approve it first or pass X-Confirm: true header."}
-            result = await asyncio.get_event_loop().run_in_executor(None, lambda: run_agent(a))
+            body = {}
+            try:
+                body = await request.json()
+            except Exception:
+                pass
+            date = body.get("date") if isinstance(body, dict) else None
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: run_agent(a, date=date))
             return result
     return {"status": "error", "error": "Agent not found"}
 

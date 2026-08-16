@@ -78,6 +78,8 @@ _ALLOWED_OVERRIDES = {
     "gemma_mode", "llm_api_base_url", "llm_api_key", "llm_model_name",
     "text_llm_api_base_url", "text_llm_api_key", "text_llm_model_name",
     "text_llm_routing", "text_llm_context_window",
+    "vision_llm_enabled", "vision_llm_api_base_url", "vision_llm_api_key",
+    "vision_llm_model_name", "vision_llm_context_window",
     "obsidian_enabled", "obsidian_vault_path",
     "notion_enabled", "notion_token", "notion_database_id",
     "webhook_enabled", "webhook_url", "webhook_events", "webhook_secret", "webhook_headers",
@@ -161,6 +163,28 @@ class Settings(BaseSettings):
     text_llm_context_window: int = Field(
         default=32768,
         description="Context window of the text model in tokens — used to budget prompts routed to it",
+        ge=2048,
+        le=1048576,
+    )
+    vision_llm_enabled: bool = Field(
+        default=False,
+        description="Route screenshot/vision requests to a dedicated vision model instead of the primary model",
+    )
+    vision_llm_api_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL of the vision-model endpoint. Empty = same endpoint as LLM_API_BASE_URL",
+    )
+    vision_llm_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for the vision-model endpoint. Empty = reuse LLM_API_KEY (only when sharing the endpoint)",
+    )
+    vision_llm_model_name: Optional[str] = Field(
+        default=None,
+        description="Dedicated model for screenshot analysis and vision chat. Empty = disabled",
+    )
+    vision_llm_context_window: int = Field(
+        default=32768,
+        description="Context window of the vision model in tokens — used to budget vision prompts",
         ge=2048,
         le=1048576,
     )

@@ -20,6 +20,8 @@ def _pin_local_backend():
         for k in (
             "gemma_mode", "text_llm_routing", "text_llm_model_name",
             "text_llm_api_base_url", "text_llm_api_key", "text_llm_context_window",
+            "vision_llm_enabled", "vision_llm_model_name",
+            "vision_llm_api_base_url", "vision_llm_api_key", "vision_llm_context_window",
         )
     }
     settings.gemma_mode = "local"
@@ -28,6 +30,11 @@ def _pin_local_backend():
     settings.text_llm_api_base_url = None
     settings.text_llm_api_key = None
     settings.text_llm_context_window = 32768
+    settings.vision_llm_enabled = False
+    settings.vision_llm_model_name = None
+    settings.vision_llm_api_base_url = None
+    settings.vision_llm_api_key = None
+    settings.vision_llm_context_window = 32768
     yield
     for k, v in original.items():
         setattr(settings, k, v)

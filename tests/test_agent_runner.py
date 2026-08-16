@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from screenmind.engine.agent_runner import (
-    _parse_md_frontmatter, get_agents_dir, get_agent_log, _log_run,
+    _parse_md_frontmatter, _parse_py_frontmatter, get_agents_dir, get_agent_log, _log_run,
 )
 
 
@@ -164,3 +164,131 @@ class TestAgentLog:
         entry = next((e for e in log if e["name"] == "truncate-test"), None)
         if entry:
             assert len(entry["output"]) <= 500
+
+
+class TestDateForwarding:
+    """run_agent(date=...) must reach Python plugins via context["date"]."""
+
+    def _probe_plugin(self, tmp_path):
+        plugin = tmp_path / "dateprobe.py"
+        plugin.write_text(
+            '"""\nname: dateprobe\ndescription: echoes the run date\n"""\n'
+            "def run(context):\n"
+            "    return f\"date={context.get('date', 'NONE')}\"\n",
+            encoding="utf-8",
+        )
+        return _parse_py_frontmatter(plugin)
+
+    def test_date_reaches_plugin_context(self, tmp_path):
+        from screenmind.engine import agent_runner
+        meta = self._probe_plugin(tmp_path)
+        with patch.object(agent_runner.settings, "agents_auto_run_python", True):
+            result = agent_runner.run_agent(meta, date="2026-08-14")
+        assert result["status"] == "ok"
+        assert "date=2026-08-14" in result["output"]
+
+    def test_no_date_omits_context_key(self, tmp_path):
+        from screenmind.engine import agent_runner
+        meta = self._probe_plugin(tmp_path)
+        with patch.object(agent_runner.settings, "agents_auto_run_python", True):
+            result = agent_runner.run_agent(meta)
+        assert result["status"] == "ok"
+        assert "date=NONE" in result["output"]
+
+
+class TestTimesheetPluginDateResolution:
+    """The shipped timesheet.py plugin: dashboard date wins over env/state."""
+
+    @pytest.fixture
+    def plugin(self):
+        import importlib.util
+        path = Path(__file__).parent.parent / "dist_build" / "timesheet_agent" / "timesheet.py"
+        spec = importlib.util.spec_from_file_location("timesheet_plugin", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_dashboard_date_beats_env(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("TIMESHEET_DATE", "2026-01-01")
+        date, err = plugin._resolve_date(tmp_path, "timesheet", ui_date="2026-08-14")
+        assert (date, err) == ("2026-08-14", None)
+
+    def test_env_used_without_dashboard_date(self, plugin, tmp_path, monkeypatch):
+        monkeypatch.setenv("TIMESHEET_DATE", "yesterday")
+        date, err = plugin._resolve_date(tmp_path, "timesheet", ui_date="")
+        assert err is None
+        assert date != ""
+
+    def test_invalid_dashboard_date_errors(self, plugin, tmp_path):
+        date, err = plugin._resolve_date(tmp_path, "timesheet", ui_date="14/08/2026")
+        assert date == ""
+        assert "dashboard date picker" in err
+
+
+class TestTimesheetJustification:
+    """mode: timesheet — the LLM classification call also yields a
+    per-entry justification (on-screen evidence), rendered as an
+    indented 'because:' line. Placeholders and LLM failures omit it."""
+
+    ACTIVITIES = [
+        {
+            "timestamp": "2026-08-16T10:00:00",
+            "window_title": "GITS PSF - HelpDesk - Ticket 99177 Details",
+            "organized_text": "password reset request from user@omeaadvisors.com",
+            "app_name": "Chrome",
+            "analyzed": True,
+        },
+        {
+            "timestamp": "2026-08-16T10:00:40",
+            "window_title": "GITS PSF - HelpDesk - Ticket 99177 Details",
+            "organized_text": "password reset request from user@omeaadvisors.com",
+            "app_name": "Chrome",
+            "analyzed": True,
+        },
+    ]
+
+    def _run(self, llm_reply=None, llm_error=None):
+        from screenmind.engine import agent_runner
+        db_inst = MagicMock()
+        db_inst.get_activities_by_date.return_value = self.ACTIVITIES
+        generate = MagicMock(side_effect=llm_error, return_value=llm_reply)
+        with patch("screenmind.storage.database.Database", return_value=db_inst), \
+             patch("screenmind.engine.llm_client.generate", generate), \
+             patch("screenmind.engine.llm_client.text_model_window", return_value=32768):
+            out = agent_runner._run_timesheet_mode(
+                {"_temperature": 0.1}, date="2026-08-16"
+            )
+        return out, generate
+
+    def test_prompt_requests_justification(self):
+        _, generate = self._run(llm_reply="T99177 | — | Password reset | —")
+        prompt = generate.call_args.kwargs["prompt"]
+        assert "JUSTIFICATION" in prompt
+        assert "ID | CUSTOMER | SUBJECT | JUSTIFICATION" in prompt
+
+    def test_justification_rendered_under_entry(self):
+        out, _ = self._run(
+            llm_reply="T99177 | OMEA ADVISORS | Password reset | "
+                      "Email thread with user about password reset"
+        )
+        lines = out.splitlines()
+        i = next(j for j, l in enumerate(lines) if l.startswith("Ticket 99177"))
+        assert lines[i + 1] == "    because: Email thread with user about password reset"
+        assert "Subtotal:" in out
+
+    def test_placeholder_justification_omitted(self):
+        out, _ = self._run(llm_reply="T99177 | — | Password reset | —")
+        assert "because:" not in out
+        assert "Ticket 99177" in out
+
+    def test_three_field_answer_still_parses(self):
+        """Old-format answers without a justification field keep working."""
+        out, _ = self._run(llm_reply="T99177 | OMEA ADVISORS | Password reset")
+        assert "Password reset" in out
+        assert "because:" not in out
+
+    def test_llm_failure_yields_timesheet_without_justification(self):
+        out, _ = self._run(llm_error=RuntimeError("model down"))
+        assert "Ticket 99177" in out
+        assert "because:" not in out
+        assert "Subtotal:" in out

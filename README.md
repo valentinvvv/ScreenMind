@@ -518,6 +518,11 @@ All settings configurable via `.env`, environment variables, or the **Settings**
 | `TEXT_LLM_MODEL_NAME` | *(empty)* | Optional second model for text-only ops (summaries, chat, agents). Screenshots/audio stay on `LLM_MODEL_NAME` |
 | `TEXT_LLM_ROUTING` | `off` | `off`, `overflow` (text requests exceeding Context Window), or `always` (all text ops) |
 | `TEXT_LLM_CONTEXT_WINDOW` | `32768` | Context window of the text model in tokens — used to budget prompts routed to it |
+| `VISION_LLM_ENABLED` | `false` | `true` routes screenshot/vision requests to the dedicated vision model |
+| `VISION_LLM_API_BASE_URL` | *(empty)* | Endpoint of the vision model. Empty = ride the primary endpoint |
+| `VISION_LLM_API_KEY` | *(empty)* | API key for the vision endpoint. Empty = reuse `LLM_API_KEY` while sharing the primary endpoint |
+| `VISION_LLM_MODEL_NAME` | *(empty)* | Optional dedicated model for screenshot analysis and vision chat. Audio stays on `LLM_MODEL_NAME` |
+| `VISION_LLM_CONTEXT_WINDOW` | `32768` | Context window of the vision model in tokens — used to budget vision prompts |
 | `ANALYSIS_MODE` | `fast` | `fast` (~12s), `balanced` (~40s), or `merged` (~76s, accurate) |
 | `PERFORMANCE_MODE` | `balanced` | GPU layers: `minimal` / `balanced` / `maximum` |
 | `BLOCKED_APPS` | *(empty)* | Comma-separated apps to never capture |
