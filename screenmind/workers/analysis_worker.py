@@ -16,6 +16,7 @@ Per-app pHash cache avoids redundant processing for similar screens:
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -110,6 +111,10 @@ class AnalysisWorker:
         # running=True also tells the idle loop to stand down.
         self._backfill_status = {"running": False, "requested": 0,
                                  "analyzed": 0, "failed": 0, "skipped": 0}
+        # Progress of the scene-description batch (POST /api/timeline/scenes/backfill).
+        # Fills in scene_description for analyzed rows that never got one.
+        self._scene_backfill_status = {"running": False, "requested": 0,
+                                       "generated": 0, "failed": 0, "skipped": 0}
 
         # Lazy-init embedder (large model download on first use)
         self._embedder_available = True
@@ -344,12 +349,17 @@ class AnalysisWorker:
                 # A11y got some text but it's chrome — keep for metadata, will use OCR as primary
                 text_method = "a11y"
 
-            # 3b. OCR — runs when a11y text is chrome-only or insufficient
+            # 3b. OCR — runs when a11y text is chrome-only or insufficient.
+            #     Serial and CPU-bound: it gates both LLM calls, so its cost
+            #     is surfaced in the completion log below.
             needs_ocr = not a11y_is_content or text_method == "none"
+            ocr_elapsed = 0.0
             if needs_ocr and self._ocr.is_available:
+                _ocr_start = time.time()
                 ocr_raw, ocr_boxes = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self._ocr.extract_text_with_boxes(capture.image)
                 )
+                ocr_elapsed = time.time() - _ocr_start
                 if ocr_boxes:
                     import json
                     ocr_boxes_json = json.dumps(ocr_boxes)
@@ -464,11 +474,14 @@ class AnalysisWorker:
                 analysis, layout_regions = result
 
                 # ── Quality gate: retry once if critical fields are missing ──
+                # scene_description is NOT a gate criterion: with text-model
+                # routing the text call below (step 3e) generates it from OCR
+                # text. Gating on it made every capture pay for a second full
+                # vision call (~12-40s) that could never fill the field,
+                # halving throughput and growing the queue.
                 _missing = []
                 if not analysis.activity_summary:
                     _missing.append("summary")
-                if not analysis.scene_description:
-                    _missing.append("scene_description")
                 if not analysis.activity_category or analysis.activity_category == "other":
                     _missing.append("category")
 
@@ -483,8 +496,8 @@ class AnalysisWorker:
                         retry_missing = []
                         if not retry_analysis.activity_summary:
                             retry_missing.append("summary")
-                        if not retry_analysis.scene_description:
-                            retry_missing.append("scene_description")
+                        if not retry_analysis.activity_category or retry_analysis.activity_category == "other":
+                            retry_missing.append("category")
                         if len(retry_missing) < len(_missing):
                             analysis, layout_regions = retry_analysis, retry_regions
                             logger.debug(f"Retry filled: {set(_missing) - set(retry_missing)}")
@@ -647,7 +660,7 @@ class AnalysisWorker:
                 f"#{self._processed} in {elapsed:.1f}s:",
                 f"{analysis.app_name} ({analysis.activity_category})",
                 f"-- {analysis.activity_summary[:50]}",
-                f"[text: {text_len} chars via {text_method}]",
+                f"[text: {text_len} chars via {text_method}]" + (f" (ocr {ocr_elapsed:.1f}s)" if ocr_elapsed else ""),
                 f"[{tier_label}]",
             ]
             if dev_ctx:
@@ -681,9 +694,9 @@ class AnalysisWorker:
     async def _backfill_skipped(self):
         """Idle-loop entry: re-analyze one unanalyzed or skipped entry.
         Catches: entries from crashes (analyzed=0) + stale skips.
-        Stands down while a manual batch is running.
+        Stands down while any manual batch is running.
         """
-        if self._backfill_status["running"]:
+        if self.backfill_running():
             return
         await self._backfill_one()
 
@@ -697,6 +710,9 @@ class AnalysisWorker:
         """
         if self._backfill_status["running"]:
             return {"already_running": True, **self._backfill_status}
+        if self._scene_backfill_status["running"]:
+            return {"error": "Scene backfill already running — try again when it finishes",
+                    **self._backfill_status}
 
         conn = self._db._get_conn()
         rows = conn.execute(
@@ -845,6 +861,118 @@ class AnalysisWorker:
             logger.error(f"Backfill #{activity_id} error: {e}")
             return "failed"
 
+    # ── Scene-description backfill (POST /api/timeline/scenes/backfill) ────
+
+    def start_scene_backfill(self, limit: int = 100) -> dict:
+        """Generate scene_description for analyzed rows that never got one.
+
+        Text-model only — narration comes from stored OCR/organized text via
+        generate_scene_from_text, never the screenshot. Runs in the background;
+        progress is visible via `scene_backfill_status` (also in `stats`).
+        Serialized with the analysis backfill: the local backend is single-slot.
+        """
+        if self._scene_backfill_status["running"]:
+            return {"already_running": True, **self._scene_backfill_status}
+        if self._backfill_status["running"]:
+            return {"error": "Analysis backfill already running — try again when it finishes",
+                    **self._scene_backfill_status}
+
+        rows = self._fetch_scene_backfill_rows(limit)
+        if not rows:
+            return {"requested": 0, "generated": 0, "failed": 0, "skipped": 0}
+
+        self._scene_backfill_status = {"running": True, "requested": len(rows),
+                                       "generated": 0, "failed": 0, "skipped": 0}
+        asyncio.create_task(self._run_scene_backfill_batch(rows))
+        logger.info(f"Scene backfill started: {len(rows)} rows (oldest first)")
+        return dict(self._scene_backfill_status)
+
+    def _fetch_scene_backfill_rows(self, limit: int) -> list:
+        """Analyzed rows with a missing scene and usable source text, oldest first."""
+        conn = self._db._get_conn()
+        return conn.execute(
+            """SELECT id, ocr_text, organized_text, app_name, window_title,
+                      summary, details, visible_text, category
+               FROM activities
+               WHERE analyzed = 1
+                 AND (scene_description IS NULL OR TRIM(scene_description) = '')
+                 AND NOT (summary LIKE 'Analysis failed%'
+                          OR summary LIKE 'Skipped (%')
+                 AND COALESCE(TRIM(organized_text), TRIM(ocr_text), '') <> ''
+               ORDER BY timestamp ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+    async def _run_scene_backfill_batch(self, rows):
+        """Generate scenes one row at a time; fresh captures pre-empt."""
+        try:
+            # Pre-load the embedding model once for the whole batch
+            await asyncio.get_event_loop().run_in_executor(None, self._ensure_embedder)
+            for row in rows:
+                if self._queue.qsize() > 0:
+                    break  # Fresh captures always take priority
+                result = await self._scene_backfill_row(row)
+                key = {"done": "generated", "failed": "failed", "skipped": "skipped"}[result]
+                self._scene_backfill_status[key] += 1
+        except Exception as e:
+            logger.error(f"Scene backfill aborted: {e}")
+        finally:
+            self._scene_backfill_status["running"] = False
+            logger.info(
+                f"Scene backfill finished: {self._scene_backfill_status['generated']} generated, "
+                f"{self._scene_backfill_status['failed']} failed, {self._scene_backfill_status['skipped']} skipped "
+                f"({self._scene_backfill_status['requested']} requested)"
+            )
+
+    async def _scene_backfill_row(self, row) -> str:
+        """Generate one scene description. Returns 'done', 'failed', or 'skipped'."""
+        (activity_id, ocr_text, organized_text, app_name, window_title,
+         summary, details, visible_text_json, category) = row
+        try:
+            # Same 40-char floor as generate_scene_from_text — skip rows whose
+            # source text can't produce a scene instead of wasting an LLM call.
+            body = (organized_text or ocr_text or "").strip()
+            if len(body) < 40:
+                return "skipped"
+
+            scene = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._analyzer.generate_scene_from_text(
+                    ocr_text=ocr_text,
+                    organized_text=organized_text,
+                    app_name=app_name,
+                    window_title=window_title,
+                ),
+            )
+            if not scene:
+                return "failed"  # Model unreachable or empty completion
+
+            # Refresh the embedding so semantic search picks up the new scene
+            embedding = None
+            if self._embedder is not None:
+                try:
+                    visible_text = json.loads(visible_text_json) if visible_text_json else []
+                except (json.JSONDecodeError, TypeError):
+                    visible_text = []
+                embedding = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._embedder.embed_activity(
+                        summary=summary or "",
+                        details=details or "",
+                        visible_text=visible_text,
+                        app_name=app_name or "",
+                        category=category or "",
+                        scene_description=scene,
+                    ),
+                )
+
+            self._db.update_scene_description(activity_id, scene, embedding=embedding)
+            logger.info(f"Scene backfill #{activity_id} complete")
+            return "done"
+        except Exception as e:
+            logger.error(f"Scene backfill #{activity_id} error: {e}")
+            return "failed"
+
     def stop(self):
         self._running = False
         logger.info(
@@ -880,12 +1008,17 @@ class AnalysisWorker:
             "cache_skips": self._cache_skips,
             "cache_size": len(self._app_cache),
             "backfill": dict(self._backfill_status),
+            "scenes": dict(self._scene_backfill_status),
         }
 
     def backfill_running(self) -> bool:
-        """True while a manual backfill batch is active."""
-        return self._backfill_status["running"]
+        """True while a manual backfill or scene-backfill batch is active."""
+        return self._backfill_status["running"] or self._scene_backfill_status["running"]
 
     @property
     def backfill_status(self) -> dict:
         return dict(self._backfill_status)
+
+    @property
+    def scene_backfill_status(self) -> dict:
+        return dict(self._scene_backfill_status)

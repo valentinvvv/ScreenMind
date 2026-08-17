@@ -366,3 +366,39 @@ class TestBackfillEndpoint:
         assert resp.status_code == 422
         resp = await client.post("/api/timeline/backfill?limit=501")
         assert resp.status_code == 422
+
+
+class TestSceneBackfillEndpoint:
+    """POST /api/timeline/scenes/backfill — generate missed scene descriptions."""
+
+    @pytest.mark.asyncio
+    async def test_scene_backfill_without_worker_returns_503(self, client):
+        """No analysis worker (test app) → 503."""
+        deps.analysis_worker = None
+        resp = await client.post("/api/timeline/scenes/backfill")
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_scene_backfill_starts_batch(self, client):
+        """With a worker, the endpoint forwards to start_scene_backfill."""
+        from unittest.mock import MagicMock
+        worker = MagicMock()
+        worker.start_scene_backfill.return_value = {
+            "running": True, "requested": 4, "generated": 0, "failed": 0, "skipped": 0,
+        }
+        deps.analysis_worker = worker
+        try:
+            resp = await client.post("/api/timeline/scenes/backfill?limit=25")
+            assert resp.status_code == 200
+            assert resp.json()["requested"] == 4
+            worker.start_scene_backfill.assert_called_once_with(limit=25)
+        finally:
+            deps.analysis_worker = None
+
+    @pytest.mark.asyncio
+    async def test_scene_backfill_limit_validation(self, client):
+        """limit outside 1..500 is rejected."""
+        resp = await client.post("/api/timeline/scenes/backfill?limit=0")
+        assert resp.status_code == 422
+        resp = await client.post("/api/timeline/scenes/backfill?limit=501")
+        assert resp.status_code == 422

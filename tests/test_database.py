@@ -151,3 +151,77 @@ def test_get_stats(db):
 
     stats = db.get_stats("2026-05-16", "2026-05-16")
     assert stats["total_activities"] == 3
+
+
+def _analyzed_activity(db, hour=10, scene=""):
+    """Insert an analyzed activity; return its id."""
+    aid = db.insert_activity(ScreenshotEntry(
+        timestamp=datetime(2026, 5, 16, hour, 0, 0),
+        screenshot_path=f"/tmp/scene_{hour}.jpg",
+        analyzed=True,
+    ))
+    db.update_activity_analysis(
+        aid,
+        ActivityRecord(
+            app_name="Chrome",
+            activity_category="browsing",
+            activity_summary="Reading docs",
+            scene_description=scene,
+        ),
+        embedding=[0.5] * 384,
+        ocr_text="some screen text",
+    )
+    return aid
+
+
+def test_update_scene_description_sets_field(db):
+    aid = _analyzed_activity(db, scene="")
+    db.update_scene_description(aid, "A browser showing documentation")
+    activity = db.get_activity_by_id(aid)
+    assert activity["scene_description"] == "A browser showing documentation"
+
+
+def test_update_scene_description_preserves_other_fields(db):
+    """Backfill must touch only the scene — summary/category/app stay intact."""
+    aid = _analyzed_activity(db, scene="")
+    db.update_scene_description(aid, "New scene")
+    activity = db.get_activity_by_id(aid)
+    assert activity["app_name"] == "Chrome"
+    assert activity["category"] == "browsing"
+    assert activity["summary"] == "Reading docs"
+    assert activity["ocr_text"] == "some screen text"
+    assert activity["analyzed"] == 1
+
+
+def test_update_scene_description_keeps_embedding_when_none(db):
+    """embedding=None (embedder unavailable) must not wipe the existing vector."""
+    aid = _analyzed_activity(db, scene="")
+    db.update_scene_description(aid, "New scene", embedding=None)
+    conn = db._get_conn()
+    blob = conn.execute(
+        "SELECT embedding FROM activities WHERE id = ?", (aid,)
+    ).fetchone()[0]
+    assert blob is not None
+    assert db._decode_embedding(blob) == [0.5] * 384
+
+
+def test_update_scene_description_replaces_embedding_when_given(db):
+    aid = _analyzed_activity(db, scene="")
+    # 0.25 is exactly representable in float32 (blob storage packs floats)
+    db.update_scene_description(aid, "New scene", embedding=[0.25] * 384)
+    conn = db._get_conn()
+    blob = conn.execute(
+        "SELECT embedding FROM activities WHERE id = ?", (aid,)
+    ).fetchone()[0]
+    assert db._decode_embedding(blob) == [0.25] * 384
+
+
+def test_update_scene_description_syncs_fts(db):
+    """The AFTER UPDATE trigger must index the new scene for keyword search."""
+    aid = _analyzed_activity(db, scene="")
+    db.update_scene_description(aid, "uniquekeyword_xyzzy in the scene")
+    conn = db._get_conn()
+    hit = conn.execute(
+        "SELECT rowid FROM activities_fts WHERE activities_fts MATCH 'uniquekeyword_xyzzy'"
+    ).fetchall()
+    assert [r[0] for r in hit] == [aid]

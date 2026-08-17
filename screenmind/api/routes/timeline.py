@@ -214,3 +214,18 @@ async def backfill_timeline(limit: int = Query(default=100, ge=1, le=500)):
     if deps.analysis_worker is None:
         raise HTTPException(status_code=503, detail="Analysis worker not available")
     return deps.analysis_worker.start_backfill_batch(limit=limit)
+
+
+@router.post("/timeline/scenes/backfill")
+async def backfill_scene_descriptions(limit: int = Query(default=100, ge=1, le=500)):
+    """Generate scene descriptions for all analyzed activities missing one.
+
+    Text-model only — narration is built from stored OCR/organized text,
+    never the screenshot, so no vision re-analysis runs. Starts a background
+    batch and returns immediately — progress is visible via GET /api/status
+    (analysis.scenes). Serialized with /api/timeline/backfill.
+    """
+    from screenmind.api import dependencies as deps
+    if deps.analysis_worker is None:
+        raise HTTPException(status_code=503, detail="Analysis worker not available")
+    return deps.analysis_worker.start_scene_backfill(limit=limit)

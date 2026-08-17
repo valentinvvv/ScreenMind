@@ -484,6 +484,7 @@ Full Swagger docs at `http://127.0.0.1:7777/docs`
 | `GET` | `/api/status` | System health, worker stats |
 | `GET` | `/api/timeline?date=2026-05-21` | Activities for a date |
 | `POST` | `/api/timeline/backfill?limit=100` | Re-analyze unanalyzed/skipped/failed rows (background) |
+| `POST` | `/api/timeline/scenes/backfill?limit=100` | Generate missing scene descriptions from stored OCR text (background, text-model only) |
 | `GET` | `/api/search?q=debugging auth` | Hybrid semantic + keyword search |
 | `POST` | `/api/chat` | Conversational AI with screen memory (SSE stream) |
 | `GET` | `/api/stats?range=day` | Analytics (categories, apps, meetings) |

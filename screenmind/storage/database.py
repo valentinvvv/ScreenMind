@@ -314,6 +314,30 @@ class Database:
         # FTS5 sync is handled automatically by AFTER UPDATE trigger
         conn.commit()
 
+    def update_scene_description(
+        self,
+        activity_id: int,
+        scene_description: str,
+        embedding: Optional[List[float]] = None,
+    ):
+        """Update only the scene description (and optionally the embedding).
+
+        Used by the scene backfill — every other analysis field stays untouched.
+        FTS5 sync is handled by the AFTER UPDATE trigger; a NULL embedding
+        keeps the existing one via COALESCE.
+        """
+        conn = self._get_conn()
+        conn.execute(
+            """
+            UPDATE activities SET
+                scene_description = ?,
+                embedding = COALESCE(?, embedding)
+            WHERE id = ?
+            """,
+            (scene_description, self._encode_embedding(embedding), activity_id),
+        )
+        conn.commit()
+
     def get_activities_by_date(
         self, target_date: str, limit: int = 200, offset: int = 0
     ) -> List[Dict[str, Any]]:

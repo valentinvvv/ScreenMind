@@ -436,3 +436,227 @@ class TestTextModelSceneWiring:
 
         saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
         assert saved.scene_description == "vision scene"
+
+
+class TestSceneBackfillBatch:
+    """POST /api/timeline/scenes/backfill — generate missed scene descriptions."""
+
+    def _worker(self, rows):
+        """AnalysisWorker whose DB returns `rows` for the scene-backfill query."""
+        from screenmind.workers.analysis_worker import AnalysisWorker
+
+        db = MagicMock()
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = rows
+        db._get_conn.return_value = conn
+        worker = AnalysisWorker(queue=asyncio.Queue(), database=db)
+        worker._embedder = MagicMock()  # Skip model download in _ensure_embedder
+        return worker
+
+    def _row(self, ocr="plenty of screen text to narrate in detail"):
+        return (1, ocr, None, "Code", "main.py - VS Code",
+                "Editing main.py", "details", '["snippet"]', "coding")
+
+    async def test_batch_counts_results(self):
+        """Each row's result lands in the right status bucket."""
+        rows = [self._row(), self._row(), self._row()]
+        worker = self._worker(rows)
+        worker._scene_backfill_row = AsyncMock(side_effect=["done", "failed", "skipped"])
+        worker._scene_backfill_status = {"running": True, "requested": 3,
+                                         "generated": 0, "failed": 0, "skipped": 0}
+        await worker._run_scene_backfill_batch(rows)
+        status = worker.scene_backfill_status
+        assert status["running"] is False
+        assert (status["generated"], status["failed"], status["skipped"]) == (1, 1, 1)
+
+    async def test_batch_preempts_on_fresh_capture(self):
+        """A fresh capture in the queue stops the batch immediately."""
+        rows = [self._row()]
+        worker = self._worker(rows)
+        worker._scene_backfill_row = AsyncMock()
+        worker._scene_backfill_status = {"running": True, "requested": 1,
+                                         "generated": 0, "failed": 0, "skipped": 0}
+        await worker._queue.put(MagicMock())  # fresh capture arrived
+        await worker._run_scene_backfill_batch(rows)
+        worker._scene_backfill_row.assert_not_awaited()
+        assert worker.scene_backfill_status["running"] is False
+
+    def test_start_gates_when_already_running(self):
+        worker = self._worker([self._row()])
+        worker._scene_backfill_status["running"] = True
+        result = worker.start_scene_backfill(limit=10)
+        assert result["already_running"] is True
+
+    def test_start_gates_when_analysis_backfill_running(self):
+        """Single-slot LLM — the two batches never run together."""
+        worker = self._worker([self._row()])
+        worker._backfill_status["running"] = True
+        result = worker.start_scene_backfill(limit=10)
+        assert "error" in result
+        assert result["running"] is False
+
+    def test_start_empty_backlog(self):
+        """No rows missing scenes → zeros, no batch started."""
+        worker = self._worker([])
+        result = worker.start_scene_backfill(limit=10)
+        assert result == {"requested": 0, "generated": 0, "failed": 0, "skipped": 0}
+        assert worker.scene_backfill_status["running"] is False
+
+    async def test_row_generates_scene_and_updates_db(self):
+        """Generated scene + refreshed embedding land in update_scene_description."""
+        worker = self._worker([])
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value="A code editor...")
+        worker._embedder.embed_activity = MagicMock(return_value=[0.1] * 384)
+        result = await worker._scene_backfill_row(self._row())
+        assert result == "done"
+        worker._db.update_scene_description.assert_called_once_with(
+            1, "A code editor...", embedding=[0.1] * 384)
+        # Text source got the stored OCR text + row context, never a screenshot
+        kwargs = worker._analyzer.generate_scene_from_text.call_args.kwargs
+        assert kwargs["ocr_text"]
+        assert kwargs["app_name"] == "Code"
+        assert kwargs["window_title"] == "main.py - VS Code"
+        # Embedding refresh includes the new scene
+        assert worker._embedder.embed_activity.call_args.kwargs["scene_description"] == "A code editor..."
+
+    async def test_row_failed_when_text_model_returns_none(self):
+        """Model unreachable / empty completion → failed, DB untouched."""
+        worker = self._worker([])
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value=None)
+        result = await worker._scene_backfill_row(self._row())
+        assert result == "failed"
+        worker._db.update_scene_description.assert_not_called()
+
+    async def test_row_skipped_when_text_too_short(self):
+        """Source text below the 40-char floor → skipped, no LLM call."""
+        worker = self._worker([])
+        worker._analyzer.generate_scene_from_text = MagicMock()
+        result = await worker._scene_backfill_row(self._row(ocr="tiny"))
+        assert result == "skipped"
+        worker._analyzer.generate_scene_from_text.assert_not_called()
+        worker._db.update_scene_description.assert_not_called()
+
+    def test_fetch_query_selects_only_missing_scenes(self, db):
+        """Query picks analyzed rows with a missing scene and usable text only."""
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        from screenmind.storage.models import ScreenshotEntry, ActivityRecord
+
+        worker = AnalysisWorker(queue=asyncio.Queue(), database=db)
+        OCR = "plenty of screen text to narrate in detail"
+
+        def _insert(hour, **rec_kwargs):
+            aid = db.insert_activity(ScreenshotEntry(
+                timestamp=datetime(2026, 8, 1, hour, 0, 0),
+                screenshot_path=f"/tmp/{hour}.jpg", analyzed=True))
+            ocr = rec_kwargs.pop("ocr", OCR)
+            db.update_activity_analysis(
+                aid, ActivityRecord(app_name="Code", activity_category="coding",
+                                    **rec_kwargs),
+                ocr_text=ocr)
+            return aid
+
+        aid_missing = _insert(10)                                    # selected
+        _insert(11, scene_description="A VS Code window with main.py")  # has scene
+        _insert(12, activity_summary="Analysis failed: timeout")     # failure placeholder
+        _insert(13, activity_summary="Skipped (screenshot deleted)")  # skip placeholder
+        aid_no_text = db.insert_activity(ScreenshotEntry(
+            timestamp=datetime(2026, 8, 1, 14, 0, 0),
+            screenshot_path="/tmp/14.jpg", analyzed=True))
+        db.update_activity_analysis(
+            aid_no_text, ActivityRecord(app_name="Code", activity_category="coding",
+                                        activity_summary="Editing main.py"))  # no OCR text
+
+        rows = worker._fetch_scene_backfill_rows(100)
+        assert [r[0] for r in rows] == [aid_missing]
+
+    def test_stats_expose_scene_backfill(self):
+        worker = self._worker([])
+        assert "scenes" in worker.stats
+        assert worker.stats["scenes"]["running"] is False
+
+    def test_backfill_running_includes_scene_batch(self):
+        """The idle loop stands down for scene batches too."""
+        worker = self._worker([])
+        worker._scene_backfill_status["running"] = True
+        assert worker.backfill_running() is True
+
+    async def test_idle_loop_stands_down_during_scene_batch(self):
+        worker = self._worker([])
+        worker._scene_backfill_status["running"] = True
+        worker._backfill_one = AsyncMock()
+        await worker._backfill_skipped()
+        worker._backfill_one.assert_not_awaited()
+
+
+class TestQualityGateSkipsScene:
+    """Regression: a missing scene_description must NOT trigger a second vision
+    call — the text model owns that field now (step 3e). Gating on it halved
+    throughput with split text/vision models and grew the queue."""
+
+    def _worker(self):
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        return AnalysisWorker(queue=asyncio.Queue(), database=MagicMock())
+
+    def _capture(self):
+        img = MagicMock()
+        img.size = (1920, 1080)
+        return CaptureResult(
+            filepath=Path(__file__),
+            timestamp=datetime.now(),
+            window_title="main.py - VS Code",
+            app_name="Code",
+            bookmarked=False,
+            image=img,
+            activity_id=7,
+            a11y_text=None,
+            phash=None,
+            is_backfill=False,
+        )
+
+    def _wire(self, worker, vision_record, analyze_fn):
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("screen text " * 10, [])))
+        worker._analyzer.analyze_screenshot_fast = analyze_fn
+        worker._dev_context.is_coding_activity = MagicMock(return_value=False)
+        worker._embedder = None
+
+    async def test_missing_scene_does_not_retry_vision(self):
+        worker = self._worker()
+        vision_record = MagicMock(
+            scene_description="",  # vision model returned no scene
+            activity_summary="Editing main.py",
+            activity_category="coding",
+            visible_text_snippets=[], detailed_context="", app_name="VS Code",
+        )
+        analyze_fn = MagicMock(return_value=(vision_record, []))
+        self._wire(worker, vision_record, analyze_fn)
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value="text scene")
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        assert analyze_fn.call_count == 1  # no quality-gate retry
+        saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
+        assert saved.scene_description == "text scene"
+
+    async def test_missing_summary_still_retries(self):
+        """The gate still fires for fields only the vision model can fill."""
+        worker = self._worker()
+        bad = MagicMock(scene_description="scene", activity_summary="",
+                        activity_category="coding",
+                        visible_text_snippets=[], detailed_context="", app_name="VS Code")
+        good = MagicMock(scene_description="scene", activity_summary="Editing main.py",
+                         activity_category="coding",
+                         visible_text_snippets=[], detailed_context="", app_name="VS Code")
+        analyze_fn = MagicMock(side_effect=[(bad, []), (good, [])])
+        self._wire(worker, None, analyze_fn)
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value=None)
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        assert analyze_fn.call_count == 2
+        saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
+        assert saved.activity_summary == "Editing main.py"
