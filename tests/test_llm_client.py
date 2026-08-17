@@ -639,6 +639,48 @@ class TestTextModelRouting:
         assert "chat_template_kwargs" not in payload
 
     @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_unreachable_text_model_falls_back_to_primary(self, mock_client_cls, mock_settings):
+        """Text endpoint down → the same request is retried on the primary
+        backend with the primary model, thinking knob dropped."""
+        import httpx as _httpx
+        self._mock_settings(mock_settings, routing="always", text_url="http://text.test/v1")
+        ok_resp = MagicMock()
+        ok_resp.json.return_value = {"choices": [{"message": {"content": "from primary"}}]}
+        ok_resp.raise_for_status = MagicMock()
+        # Capture a snapshot of each attempt's payload (the dict is mutated in place)
+        captured = []
+        def _post(url, json=None, headers=None):
+            captured.append((url, dict(json)))
+            if len(captured) == 1:
+                raise _httpx.ConnectError("text endpoint down")
+            return ok_resp
+        mock_client_cls.return_value.post.side_effect = _post
+        result = chat([{"role": "user", "content": "short"}], max_tokens=64)
+        assert result == "from primary"
+        assert len(captured) == 2
+        first_url, first_payload = captured[0]
+        second_url, second_payload = captured[1]
+        assert first_url == "http://text.test/v1/chat/completions"
+        assert first_payload["model"] == "big-model"
+        assert second_url == "http://api.test/v1/chat/completions"
+        assert second_payload["model"] == "primary-model"
+        assert "chat_template_kwargs" not in second_payload
+
+    @patch("screenmind.engine.llm_client.settings")
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_both_endpoints_down_raises(self, mock_client_cls, mock_settings):
+        """When the fallback also fails, the error surfaces to the caller."""
+        import httpx as _httpx
+        self._mock_settings(mock_settings, routing="always", text_url="http://text.test/v1")
+        mock_client_cls.return_value.post.side_effect = [
+            _httpx.ConnectError("text down"), _httpx.ConnectError("primary down"),
+        ]
+        with pytest.raises(_httpx.ConnectError):
+            chat([{"role": "user", "content": "short"}], max_tokens=64)
+        assert mock_client_cls.return_value.post.call_count == 2
+
+    @patch("screenmind.engine.llm_client.settings")
     def test_local_primary_without_text_url_never_routes(self, mock_settings):
         """llama-server serves one model — without a text URL there is nowhere
         to route to."""

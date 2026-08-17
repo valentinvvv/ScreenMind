@@ -279,22 +279,24 @@ def chat(
 
     use_text_model = _route_to_text_model(messages, max_tokens)
     use_vision_model = not use_text_model and _route_to_vision_model(messages)
-    if use_text_model:
-        # The text model is always addressed as an OpenAI-compatible endpoint,
-        # even when the primary backend is the local llama-server.
-        url = f"{_text_base_url()}/chat/completions"
-        headers = _text_auth_headers()
-    elif use_vision_model:
-        # Same rule for the dedicated vision model.
-        url = f"{_vision_base_url()}/chat/completions"
-        headers = _vision_auth_headers()
-    else:
+
+    def _endpoint(route: str):
+        """(url, headers) for a route: 'text', 'vision', or 'primary'."""
+        if route == "text":
+            # The text model is always addressed as an OpenAI-compatible endpoint,
+            # even when the primary backend is the local llama-server.
+            return f"{_text_base_url()}/chat/completions", _text_auth_headers()
+        if route == "vision":
+            # Same rule for the dedicated vision model.
+            return f"{_vision_base_url()}/chat/completions", _vision_auth_headers()
         url = (
             f"{_base_url()}/chat/completions"
             if _is_custom_backend()
             else f"{_base_url()}/v1/chat/completions"
         )
-        headers = _auth_headers()
+        return url, _auth_headers()
+
+    url, headers = _endpoint("text" if use_text_model else "vision" if use_vision_model else "primary")
     payload = {
         "messages": messages,
         "temperature": temperature,
@@ -315,29 +317,47 @@ def chat(
         # chat_template_kwargs is vLLM's knob; other servers ignore it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
-    # Create a dedicated client for this request so it can be closed independently
-    client = httpx.Client(timeout=timeout)
-    with _client_lock:
-        _active_client = client
-
-    try:
-        response = client.post(url, json=payload, headers=headers)
-        _raise_with_detail(response)
-        data = response.json()
-        return _extract_content(data)
-    except Exception as e:
-        # Check if this was a cancellation (flag set + connection error)
-        if _cancel_event.is_set():
-            raise InferenceCancelled("Inference cancelled for chat priority") from e
-        raise
-    finally:
+    # Create a dedicated client per attempt so each can be closed independently
+    attempts = ["secondary", "primary"] if (use_text_model or use_vision_model) else ["primary"]
+    last_exc = None
+    for attempt in attempts:
+        if attempt == "primary" and attempts[0] == "secondary":
+            # Secondary endpoint failed — retry on the primary backend
+            url, headers = _endpoint("primary")
+            if use_text_model:
+                payload.pop("chat_template_kwargs", None)
+            payload["model"] = settings.llm_model_name if _is_custom_backend() else None
+            if payload.get("model") is None:
+                payload.pop("model", None)
+            logger.warning(
+                f"{'Text' if use_text_model else 'Vision'} model unreachable — "
+                f"falling back to the primary model"
+            )
+        client = httpx.Client(timeout=timeout)
         with _client_lock:
-            if _active_client is client:
-                _active_client = None
+            _active_client = client
         try:
-            client.close()
-        except Exception:
-            pass
+            response = client.post(url, json=payload, headers=headers)
+            _raise_with_detail(response)
+            data = response.json()
+            return _extract_content(data)
+        except Exception as e:
+            last_exc = e
+            # Check if this was a cancellation (flag set + connection error)
+            if _cancel_event.is_set():
+                raise InferenceCancelled("Inference cancelled for chat priority") from e
+            if attempt == "secondary":
+                continue  # try the primary endpoint
+            raise
+        finally:
+            with _client_lock:
+                if _active_client is client:
+                    _active_client = None
+            try:
+                client.close()
+            except Exception:
+                pass
+    raise last_exc  # unreachable — every attempt returns or raises
 
 
 def chat_with_images(
