@@ -72,6 +72,10 @@ Screenshot
     │         │
     │         └── Organized text with [SECTION] headers
     │
+    ├──▶ Text model (scene narration, optional)  ◀── organized text in, no image
+    │         │
+    │         └── scene_description (overwrites the vision model's field)
+    │
     └──▶ MiniLM-L6-v2 (semantic embedding, ~50ms, CPU)
               │
               └── 384-dim vector for similarity search
@@ -79,11 +83,12 @@ Screenshot
     All results → SQLite + FTS5
 ```
 
-Four AI models working in concert:
+Five models working in concert:
 1. **EasyOCR** — extracts raw screen text (what's written)
 2. **Gemma 4** — understands what you're doing (the brain)
 3. **Layout Analyzer** — organizes text by screen region (spatial intelligence)
-4. **MiniLM-L6-v2** — enables "search by meaning" (semantic vectors)
+4. **Text model** (optional) — narrates the scene from extracted text, per Text Model routing
+5. **MiniLM-L6-v2** — enables "search by meaning" (semantic vectors)
 
 ---
 
@@ -152,6 +157,8 @@ Cache: LRU OrderedDict, max 30 entries, keyed by `(app_name, window_title[:100])
 **Balanced mode:** Same analysis-only prompt as fast, but allows Gemma to think naturally. Produces richer `scene_description` and `activity_summary` than fast, without the layout overhead. Layout computed from OCR box positions.
 
 **Fast mode:** Pre-fills the `<think>\n</think>\n` block in the assistant message, forcing Gemma to skip reasoning and output immediately. Layout computed from OCR box positions.
+
+**Scene description:** The vision model's `scene_description` is overwritten by a text-model call (`generate_scene_from_text`) that narrates the screen from organized/OCR text only — no image is sent. If that call fails or returns nothing, the vision-generated scene is kept.
 
 ### 3.4 Layout Analyzer — Spatial OCR Organization
 
@@ -523,10 +530,12 @@ Capabilities per platform:
                                 │  5. URL extraction                   │
                                 │  6. Gemma 4 analysis + layout        │
                                 │  7. Organize text by regions         │
-                                │  8. Git context (if coding)          │
-                                │  9. MiniLM embedding                 │
-                                │ 10. Store all to SQLite              │
-                                │ 11. Auto-bookmark check              │
+                                │  8. Scene narration via text model   │
+                                │     (from organized text, no image)  │
+                                │  9. Git context (if coding)          │
+                                │ 10. MiniLM embedding                 │
+                                │ 11. Store all to SQLite              │
+                                │ 12. Auto-bookmark check              │
                                 └──────────────────────────────────────┘
                                                  │
                                                  ▼

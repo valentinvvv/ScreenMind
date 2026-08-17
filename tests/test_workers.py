@@ -272,6 +272,83 @@ class TestBackfillFailureLoop:
         assert 450 in worker._backfill_cooldown
 
 
+
+class TestManualBackfillBatch:
+    """POST /api/timeline/backfill — batch re-analysis of pending rows."""
+
+    def _worker(self, rows):
+        """AnalysisWorker whose DB returns `rows` for the backfill query."""
+        from screenmind.workers.analysis_worker import AnalysisWorker
+
+        db = MagicMock()
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = rows
+        db._get_conn.return_value = conn
+        return AnalysisWorker(queue=asyncio.Queue(), database=db)
+
+    async def test_batch_processes_rows_and_counts(self):
+        """Each row's result lands in the right status bucket."""
+        rows = [(1, "a.jpg", "t1", "app1", None, None),
+                (2, "b.jpg", "t2", "app2", None, None),
+                (3, "c.jpg", "t3", "app3", None, None)]
+        worker = self._worker(rows)
+        worker._backfill_row = AsyncMock(side_effect=["done", "failed", "skipped"])
+        worker._backfill_status = {"running": True, "requested": 3,
+                                   "analyzed": 0, "failed": 0, "skipped": 0}
+        await worker._run_backfill_batch(rows, MagicMock())
+        status = worker.backfill_status
+        assert status["running"] is False
+        assert (status["analyzed"], status["failed"], status["skipped"]) == (1, 1, 1)
+
+    async def test_batch_preempts_on_fresh_capture(self):
+        """A fresh capture in the queue stops the batch immediately."""
+        rows = [(1, "a.jpg", "t", "app", None, None)]
+        worker = self._worker(rows)
+        worker._backfill_row = AsyncMock()
+        worker._backfill_status = {"running": True, "requested": 1,
+                                   "analyzed": 0, "failed": 0, "skipped": 0}
+        await worker._queue.put(MagicMock())  # fresh capture arrived
+        await worker._run_backfill_batch(rows, MagicMock())
+        worker._backfill_row.assert_not_awaited()
+        assert worker.backfill_status["running"] is False
+
+    def test_start_gates_when_already_running(self):
+        """A second start while a batch runs returns already_running."""
+        worker = self._worker([(1, "a.jpg", "t", "app", None, None)])
+        worker._backfill_status["running"] = True
+        result = worker.start_backfill_batch(limit=10)
+        assert result["already_running"] is True
+
+    def test_start_empty_backlog(self):
+        """No pending rows → zeros, no batch started."""
+        worker = self._worker([])
+        result = worker.start_backfill_batch(limit=10)
+        assert result == {"requested": 0, "analyzed": 0, "failed": 0, "skipped": 0}
+        assert worker.backfill_running() is False
+
+    async def test_start_spawns_batch_and_completes(self):
+        """start_backfill_batch returns immediately; the task drains the rows."""
+        rows = [(1, "a.jpg", "t", "app", None, None)]
+        worker = self._worker(rows)
+        worker._backfill_row = AsyncMock(return_value="done")
+        result = worker.start_backfill_batch(limit=10)
+        assert result["running"] is True
+        assert result["requested"] == 1
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if not worker.backfill_running():
+                break
+        assert worker.backfill_status["analyzed"] == 1
+        worker._backfill_row.assert_awaited_once()
+
+    async def test_idle_loop_stands_down_during_batch(self):
+        """The 2s idle backfill doesn't race the manual batch."""
+        worker = self._worker([(1, "a.jpg", "t", "app", None, None)])
+        worker._backfill_status["running"] = True
+        worker._backfill_one = AsyncMock()
+        await worker._backfill_skipped()
+        worker._backfill_one.assert_not_awaited()
+
 class TestFailureSummaryHelper:
     """Tests for _is_failure_summary — guards cache writes and backfill."""
 
@@ -286,3 +363,76 @@ class TestFailureSummaryHelper:
         assert _is_failure_summary("Skipped (analysis backlog)") is False
         assert _is_failure_summary("") is False
         assert _is_failure_summary(None) is False
+
+
+class TestTextModelSceneWiring:
+    """_process must generate scene_description via the text-only model
+    (generate_scene_from_text) and prefer it over the vision model's field."""
+
+    def _worker(self):
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        return AnalysisWorker(queue=asyncio.Queue(), database=MagicMock())
+
+    def _capture(self):
+        img = MagicMock()
+        img.size = (1920, 1080)
+        return CaptureResult(
+            filepath=Path(__file__),
+            timestamp=datetime.now(),
+            window_title="main.py - VS Code",
+            app_name="Code",
+            bookmarked=False,
+            image=img,
+            activity_id=7,
+            a11y_text=None,
+            phash=None,  # forces full tier (no cache comparison)
+            is_backfill=False,
+        )
+
+
+    async def test_text_scene_overwrites_vision_scene(self):
+        worker = self._worker()
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("screen text " * 10, [])))
+        worker._analyzer.analyze_screenshot_fast = MagicMock(
+            return_value=(MagicMock(
+                scene_description="vision scene",
+                activity_summary="Editing main.py",
+                activity_category="coding",
+                visible_text_snippets=[], detailed_context="", app_name="VS Code",
+            ), []))
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value="text scene")
+        worker._dev_context.is_coding_activity = MagicMock(return_value=False)
+        worker._embedder = None
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
+        assert saved.scene_description == "text scene"
+        # Text source got the OCR text, not the screenshot
+        worker._analyzer.generate_scene_from_text.assert_called_once()
+        assert worker._analyzer.generate_scene_from_text.call_args.kwargs["ocr_text"]
+
+    async def test_vision_scene_kept_when_text_scene_fails(self):
+        worker = self._worker()
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("screen text " * 10, [])))
+        vision_record = MagicMock(
+            scene_description="vision scene",
+            activity_summary="Editing main.py",
+            activity_category="coding",
+            visible_text_snippets=[], detailed_context="", app_name="VS Code",
+        )
+        worker._analyzer.analyze_screenshot_fast = MagicMock(return_value=(vision_record, []))
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value=None)
+        worker._dev_context.is_coding_activity = MagicMock(return_value=False)
+        worker._embedder = None
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
+        assert saved.scene_description == "vision scene"

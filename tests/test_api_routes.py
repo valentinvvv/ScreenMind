@@ -330,3 +330,39 @@ class TestTextModelWindowPick:
         prompt_tokens = len(captured["prompt"]) / 2
         assert prompt_tokens + captured["max_tokens"] <= 32768
         assert prompt_tokens > settings.context_window  # overflowed the primary
+
+
+class TestBackfillEndpoint:
+    """POST /api/timeline/backfill — manual batch re-analysis."""
+
+    @pytest.mark.asyncio
+    async def test_backfill_without_worker_returns_503(self, client):
+        """No analysis worker (test app) → 503."""
+        deps.analysis_worker = None
+        resp = await client.post("/api/timeline/backfill")
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_backfill_starts_batch(self, client):
+        """With a worker, the endpoint forwards to start_backfill_batch."""
+        from unittest.mock import MagicMock
+        worker = MagicMock()
+        worker.start_backfill_batch.return_value = {
+            "running": True, "requested": 3, "analyzed": 0, "failed": 0, "skipped": 0,
+        }
+        deps.analysis_worker = worker
+        try:
+            resp = await client.post("/api/timeline/backfill?limit=50")
+            assert resp.status_code == 200
+            assert resp.json()["requested"] == 3
+            worker.start_backfill_batch.assert_called_once_with(limit=50)
+        finally:
+            deps.analysis_worker = None
+
+    @pytest.mark.asyncio
+    async def test_backfill_limit_validation(self, client):
+        """limit outside 1..500 is rejected."""
+        resp = await client.post("/api/timeline/backfill?limit=0")
+        assert resp.status_code == 422
+        resp = await client.post("/api/timeline/backfill?limit=501")
+        assert resp.status_code == 422

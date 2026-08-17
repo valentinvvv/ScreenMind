@@ -1,5 +1,7 @@
 """Tests for engine/analyzer.py — response parsing logic (no Ollama needed)."""
 
+from unittest.mock import patch
+
 from screenmind.engine.analyzer import GemmaAnalyzer
 
 
@@ -66,3 +68,74 @@ def test_normalize_confidence_clamping():
     record = ActivityRecord(confidence=0.0)
     normalized = analyzer._normalize(record)
     assert normalized.confidence == 0.0
+
+
+class TestSceneFromText:
+    """generate_scene_from_text — scene narration via the text-only model."""
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_returns_stripped_scene_with_context(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.return_value = "  A terminal running pytest  "
+        scene = GemmaAnalyzer().generate_scene_from_text(
+            ocr_text="collected 12 items " * 10,
+            app_name="Windows Terminal",
+            window_title="pytest",
+        )
+        assert scene == "A terminal running pytest"
+        messages = mock_llm.chat.call_args.kwargs["messages"]
+        # Text-only payload — llm_client routes it per text_llm_routing
+        assert all(isinstance(m["content"], str) for m in messages)
+        assert "OS-detected app: Windows Terminal" in messages[0]["content"]
+        assert "Window title: pytest" in messages[0]["content"]
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_organized_text_preferred_over_raw_ocr(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = 16384
+        mock_llm.chat.return_value = "scene"
+        GemmaAnalyzer().generate_scene_from_text(
+            ocr_text="raw ocr words " * 20,
+            organized_text="[main_content] organized body " * 20,
+        )
+        prompt = mock_llm.chat.call_args.kwargs["messages"][0]["content"]
+        assert "[main_content] organized body" in prompt
+        assert "raw ocr words" not in prompt
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_short_text_skips_llm(self, mock_settings, mock_llm):
+        assert GemmaAnalyzer().generate_scene_from_text(ocr_text="too short") is None
+        assert GemmaAnalyzer().generate_scene_from_text(ocr_text=None) is None
+        mock_llm.chat.assert_not_called()
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_llm_error_returns_none(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.side_effect = RuntimeError("server down")
+        assert GemmaAnalyzer().generate_scene_from_text(ocr_text="x" * 100) is None
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_empty_response_returns_none(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.return_value = "   "
+        assert GemmaAnalyzer().generate_scene_from_text(ocr_text="y" * 100) is None
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_prompt_budgeted_to_window(self, mock_settings, mock_llm):
+        mock_settings.context_window = 2048
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.return_value = "scene"
+        GemmaAnalyzer().generate_scene_from_text(ocr_text="z" * 50000)
+        prompt = mock_llm.chat.call_args.kwargs["messages"][0]["content"]
+        budget = (2048 - 700) * 2  # window minus prompt+output, at 2 chars/token
+        assert "z" * budget in prompt
+        assert "z" * (budget + 1) not in prompt

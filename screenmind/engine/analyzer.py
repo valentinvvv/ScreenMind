@@ -393,6 +393,63 @@ class GemmaAnalyzer:
         image = open_image(image_path)
         return self.analyze_screenshot(image, **kwargs)
 
+    def generate_scene_from_text(
+        self,
+        ocr_text: Optional[str],
+        organized_text: Optional[str] = None,
+        app_name: Optional[str] = None,
+        window_title: Optional[str] = None,
+    ) -> Optional[str]:
+        """Describe the screen from its text content via the text-only model.
+
+        Builds a text-only chat request — llm_client routes it to the
+        configured text model per text_llm_routing ('always' / overflow),
+        otherwise the primary model handles it. Returns the description,
+        or None when there is no usable text or the call fails.
+        Never raises: scene narration is a non-critical enrichment.
+        """
+        body = (organized_text or ocr_text or "").strip()
+        if len(body) < 40:
+            return None
+        # Budget the prompt against the destination window: the request lands
+        # on the text model when routing is active, else on the primary.
+        window = llm_client.text_model_window() or settings.context_window
+        budget_chars = max(1000, (window - 700) * 2)  # 700 ≈ prompt + output tokens
+        if len(body) > budget_chars:
+            body = body[:budget_chars]
+
+        context = []
+        if app_name:
+            context.append(f"OS-detected app: {app_name}")
+        if window_title:
+            context.append(f"Window title: {window_title}")
+        context_str = f"Context: {chr(10).join(context)}{chr(10)}" if context else ""
+
+        prompt = (
+            f"{context_str}"
+            f"Below is text extracted from a screenshot (organized by screen region when possible). "
+            f"Write a detailed scene description: a plain inventory of everything visible — "
+            f"every UI element, message, and text item. Do NOT summarize.\n\n"
+            f"{body}"
+        )
+
+        start_time = time.time()
+        try:
+            raw = llm_client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=512,
+            )
+        except Exception as e:
+            logger.warning(f"Text-model scene description failed: {e}")
+            return None
+
+        scene = (raw or "").strip()
+        if not scene:
+            return None
+        logger.info(f"Text-model scene description done in {time.time() - start_time:.1f}s")
+        return scene
+
     def analyze_screenshot_balanced(
         self,
         image: Image.Image,

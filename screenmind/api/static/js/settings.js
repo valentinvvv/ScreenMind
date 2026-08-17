@@ -91,7 +91,7 @@ async function renderSettings(el) {
   + '<div class="radio-group">' + _rp('text_llm_routing','off','Off',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','overflow','On overflow',cfg.text_llm_routing || 'off') + _rp('text_llm_routing','always','Always',cfg.text_llm_routing || 'off') + '</div></div>'
   + '<div class="settings-input-row"><label class="settings-label">Context Window:</label>'
   + '<input type="number" id="text-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.text_llm_context_window || 32768) + '"></div>'
-  + '<div class="settings-note" style="margin-top:4px"><strong>On overflow</strong>: text requests that exceed the primary Context Window go to this model. <strong>Always</strong>: all text operations use it. Screenshots and audio always stay on the primary model. Leave Model empty to disable.</div>'
+  + '<div class="settings-note" style="margin-top:4px"><strong>On overflow</strong>: text requests that exceed the primary Context Window go to this model. <strong>Always</strong>: all text operations use it. Scene descriptions are generated from extracted screen text and follow this routing. Screenshot images and audio always stay on the primary model. Leave Model empty to disable.</div>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testTextLLM()">Test Connection</button><span id="text-llm-test-result" style="font-size:0.8rem"></span></div></div>'
 
   // ── VISION MODEL (own card — dedicated model for screenshot analysis) ──
@@ -108,7 +108,7 @@ async function renderSettings(el) {
   + '<datalist id="vision-llm-model-options"></datalist>'
   + '<div class="settings-input-row"><label class="settings-label">Context Window:</label>'
   + '<input type="number" id="vision-llm-context-window" class="settings-text-input" style="max-width:140px" min="2048" value="' + (cfg.vision_llm_context_window || 32768) + '"></div>'
-  + '<div class="settings-note" style="margin-top:4px">When enabled, screenshot analysis and image chat go to this model instead of the primary one. Audio transcription stays on the primary model. Toggle off (or leave Model empty) to keep everything on the primary model.</div>'
+  + '<div class="settings-note" style="margin-top:4px">When enabled, screenshot analysis and image chat go to this model instead of the primary one. Scene descriptions are generated from extracted screen text via the Text Model routing, not from this model. Audio transcription stays on the primary model. Toggle off (or leave Model empty) to keep everything on the primary model.</div>'
   + '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button class="btn btn-sm" onclick="testVisionLLM()">Test Connection</button><span id="vision-llm-test-result" style="font-size:0.8rem"></span></div></div></div>'
 
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Performance Mode</div><div class="settings-desc">Controls GPU layer offloading for inference</div></div></div>'

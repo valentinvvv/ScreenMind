@@ -38,6 +38,7 @@ class CaptureResult:
     activity_id: Optional[int] = None
     a11y_text: Optional[str] = None  # Pre-captured at screenshot time (correct window)
     phash: Optional[object] = None  # imagehash.ImageHash for per-app cache comparison
+    is_backfill: bool = False  # Set for backfilled rows — labels analysis_method
 
 
 class CaptureWorker:

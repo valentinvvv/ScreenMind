@@ -106,7 +106,10 @@ class AnalysisWorker:
         self._running = False
         self._processed = 0
         self._errors = 0
-        self._is_backfill = False  # Set by _backfill_skipped for method labeling
+        # Progress of the manual batch (POST /api/timeline/backfill).
+        # running=True also tells the idle loop to stand down.
+        self._backfill_status = {"running": False, "requested": 0,
+                                 "analyzed": 0, "failed": 0, "skipped": 0}
 
         # Lazy-init embedder (large model download on first use)
         self._embedder_available = True
@@ -288,7 +291,7 @@ class AnalysisWorker:
             # --- Tier "identical": copy everything from cache, skip OCR entirely ---
             if tier == "identical":
                 active_url = cached.get("active_url")
-                method_label = "backfill:cache:identical" if self._is_backfill else "cache:identical"
+                method_label = "backfill:cache:identical" if capture.is_backfill else "cache:identical"
                 self._db.update_activity_analysis(
                     activity_id=activity_id,
                     analysis=cached["analysis"],
@@ -503,9 +506,31 @@ class AnalysisWorker:
                     except Exception as e:
                         logger.debug(f"Text organization failed (non-fatal): {e}")
 
+            # 3e. Scene description via the text-only model — from OCR text,
+            #     never the screenshot. Runs on minor + full tiers; identical
+            #     copies the cached record. Overwrites the vision model's
+            #     scene_description when it produces one; on failure the
+            #     vision-generated scene (if any) stays untouched.
+            loop = asyncio.get_event_loop()
+            try:
+                text_scene = await loop.run_in_executor(
+                    None,
+                    lambda: self._analyzer.generate_scene_from_text(
+                        ocr_text=ocr_text,
+                        organized_text=organized_text,
+                        app_name=capture.app_name,
+                        window_title=capture.window_title,
+                    ),
+                )
+            except Exception as e:
+                logger.debug(f"Text-model scene description skipped: {e}")
+                text_scene = None
+            if text_scene:
+                analysis.scene_description = text_scene
+                text_method += "+scene"
+
             # 4+5. Developer context + Semantic embedding — run in parallel
             #       Both are independent CPU tasks, no shared state.
-            loop = asyncio.get_event_loop()
 
             async def _get_dev_context():
                 if self._dev_context.is_coding_activity(
@@ -546,7 +571,7 @@ class AnalysisWorker:
 
             # 6. Update DB with all results
             analysis_label = f"cache:minor" if tier == "minor" else f"full:{settings.analysis_mode}"
-            if self._is_backfill:
+            if capture.is_backfill:
                 analysis_label = f"backfill:{analysis_label}"
             self._db.update_activity_analysis(
                 activity_id=activity_id,
@@ -654,11 +679,67 @@ class AnalysisWorker:
             )
 
     async def _backfill_skipped(self):
-        """Re-analyze one unanalyzed or skipped entry when idle.
+        """Idle-loop entry: re-analyze one unanalyzed or skipped entry.
         Catches: entries from crashes (analyzed=0) + stale skips.
+        Stands down while a manual batch is running.
         """
+        if self._backfill_status["running"]:
+            return
+        await self._backfill_one()
+
+    def start_backfill_batch(self, limit: int = 100) -> dict:
+        """Kick off a manual backfill batch in the background; returns immediately.
+
+        Unlike the idle loop: no 24h window, no cooldown filter, oldest
+        first — the user explicitly asked for these rows. Fresh captures
+        in the queue still pre-empt the batch. Progress is visible via
+        `backfill_status` (also in `stats`).
+        """
+        if self._backfill_status["running"]:
+            return {"already_running": True, **self._backfill_status}
+
+        conn = self._db._get_conn()
+        rows = conn.execute(
+            """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes
+               FROM activities
+               WHERE (analyzed = 0
+                  OR summary = 'Skipped (analysis backlog)'
+                  OR summary LIKE 'Analysis failed%')
+               ORDER BY timestamp ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+        if not rows:
+            return {"requested": 0, "analyzed": 0, "failed": 0, "skipped": 0}
+
+        self._backfill_status = {"running": True, "requested": len(rows),
+                                 "analyzed": 0, "failed": 0, "skipped": 0}
+        asyncio.create_task(self._run_backfill_batch(rows, conn))
+        logger.info(f"Manual backfill started: {len(rows)} rows (oldest first)")
+        return dict(self._backfill_status)
+
+    async def _run_backfill_batch(self, rows, conn):
+        """Process the batch one row at a time; fresh captures pre-empt."""
         try:
-            activity_id = None
+            for row in rows:
+                if self._queue.qsize() > 0:
+                    break  # Fresh captures always take priority
+                result = await self._backfill_row(row, conn)
+                key = {"done": "analyzed", "failed": "failed", "skipped": "skipped"}[result]
+                self._backfill_status[key] += 1
+        except Exception as e:
+            logger.error(f"Manual backfill aborted: {e}")
+        finally:
+            self._backfill_status["running"] = False
+            logger.info(
+                f"Manual backfill finished: {self._backfill_status['analyzed']} analyzed, "
+                f"{self._backfill_status['failed']} failed, {self._backfill_status['skipped']} skipped "
+                f"({self._backfill_status['requested']} requested)"
+            )
+
+    async def _backfill_one(self):
+        """Pick one pending row (newest-first, 24h window, cooldown-aware)."""
+        try:
             conn = self._db._get_conn()
             rows = conn.execute(
                 """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes
@@ -684,21 +765,28 @@ class AnalysisWorker:
             if not row:
                 return  # Nothing to backfill (or everything is cooling down)
 
-            activity_id, ss_path, window_title, app_name, ocr_text, ocr_boxes_raw = row
-
-            # Check screenshot still exists on disk
-            if not ss_path or not Path(ss_path).exists():
-                # Screenshot deleted — mark as permanently skipped
-                conn.execute(
-                    "UPDATE activities SET summary = 'Skipped (screenshot deleted)' WHERE id = ?",
-                    (activity_id,),
-                )
-                conn.commit()
-                return
-
             # Abort if fresh captures arrived
             if self._queue.qsize() > 0:
                 return
+
+            await self._backfill_row(row, conn)
+        except Exception as e:
+            logger.error(f"Backfill error: {e}")
+
+    async def _backfill_row(self, row, conn) -> str:
+        """Backfill a single row. Returns 'done', 'failed', or 'skipped'."""
+        activity_id, ss_path, window_title, app_name, _ocr_text, _ocr_boxes_raw = row
+        try:
+            # Check screenshot still exists on disk
+            if not ss_path or not Path(ss_path).exists():
+                # Screenshot deleted — mark as permanently skipped
+                # (analyzed=1 so it stops matching the backfill query)
+                conn.execute(
+                    "UPDATE activities SET analyzed = 1, summary = 'Skipped (screenshot deleted)' WHERE id = ?",
+                    (activity_id,),
+                )
+                conn.commit()
+                return "skipped"
 
             logger.info(f"Backfilling #{activity_id} ({app_name})...")
 
@@ -715,7 +803,7 @@ class AnalysisWorker:
                     (activity_id,),
                 )
                 conn.commit()
-                return
+                return "skipped"
 
             import imagehash
             phash = imagehash.phash(img)
@@ -730,13 +818,10 @@ class AnalysisWorker:
                 activity_id=activity_id,
                 a11y_text=None,
                 phash=phash,
+                is_backfill=True,
             )
 
-            self._is_backfill = True
-            try:
-                await self._process(capture)
-            finally:
-                self._is_backfill = False
+            await self._process(capture)
 
             # Still a failure placeholder? Back off instead of looping.
             new_summary = conn.execute(
@@ -750,14 +835,15 @@ class AnalysisWorker:
                         k: v for k, v in self._backfill_cooldown.items() if v > cutoff
                     }
                 logger.warning(f"Backfill #{activity_id} failed again — next retry in 10 min")
-                return
+                return "failed"
             self._backfill_cooldown.pop(activity_id, None)
             logger.info(f"Backfill #{activity_id} complete")
+            return "done"
 
         except Exception as e:
-            if activity_id is not None:
-                self._backfill_cooldown[activity_id] = time.time()
-            logger.error(f"Backfill error: {e}")
+            self._backfill_cooldown[activity_id] = time.time()
+            logger.error(f"Backfill #{activity_id} error: {e}")
+            return "failed"
 
     def stop(self):
         self._running = False
@@ -793,4 +879,13 @@ class AnalysisWorker:
             "cache_hits": self._cache_hits,
             "cache_skips": self._cache_skips,
             "cache_size": len(self._app_cache),
+            "backfill": dict(self._backfill_status),
         }
+
+    def backfill_running(self) -> bool:
+        """True while a manual backfill batch is active."""
+        return self._backfill_status["running"]
+
+    @property
+    def backfill_status(self) -> dict:
+        return dict(self._backfill_status)

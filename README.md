@@ -143,7 +143,7 @@ Gemma 4 is not a bolt-on — it's architecturally load-bearing. ScreenMind uses 
 Every screenshot is sent to Gemma 4 with OCR context. It returns structured JSON:
 - App name, activity category, summary, detailed context
 - Mood classification, confidence score
-- Rich scene description (every visible element inventoried)
+- Rich scene description (every visible element inventoried) — generated from extracted screen text via the Text Model routing, not from the image
 - Layout regions (sidebar, chat area, toolbar boundaries)
 
 **Three modes** *(benchmarked on GTX 1650 4GB — scales dramatically with better GPUs):*
@@ -483,6 +483,7 @@ Full Swagger docs at `http://127.0.0.1:7777/docs`
 |--------|----------|-------------|
 | `GET` | `/api/status` | System health, worker stats |
 | `GET` | `/api/timeline?date=2026-05-21` | Activities for a date |
+| `POST` | `/api/timeline/backfill?limit=100` | Re-analyze unanalyzed/skipped/failed rows (background) |
 | `GET` | `/api/search?q=debugging auth` | Hybrid semantic + keyword search |
 | `POST` | `/api/chat` | Conversational AI with screen memory (SSE stream) |
 | `GET` | `/api/stats?range=day` | Analytics (categories, apps, meetings) |
@@ -515,7 +516,7 @@ All settings configurable via `.env`, environment variables, or the **Settings**
 | `LLM_MODEL_NAME` | `gemma4:e2b` | Model name sent to the custom endpoint |
 | `TEXT_LLM_API_BASE_URL` | *(empty)* | Endpoint of the text model. Empty = ride the primary endpoint |
 | `TEXT_LLM_API_KEY` | *(empty)* | API key for the text endpoint. Empty = reuse `LLM_API_KEY` while sharing the primary endpoint |
-| `TEXT_LLM_MODEL_NAME` | *(empty)* | Optional second model for text-only ops (summaries, chat, agents). Screenshots/audio stay on `LLM_MODEL_NAME` |
+| `TEXT_LLM_MODEL_NAME` | *(empty)* | Optional second model for text-only ops (summaries, chat, agents, scene descriptions from extracted screen text). Screenshot images/audio stay on `LLM_MODEL_NAME` |
 | `TEXT_LLM_ROUTING` | `off` | `off`, `overflow` (text requests exceeding Context Window), or `always` (all text ops) |
 | `TEXT_LLM_CONTEXT_WINDOW` | `32768` | Context window of the text model in tokens — used to budget prompts routed to it |
 | `VISION_LLM_ENABLED` | `false` | `true` routes screenshot/vision requests to the dedicated vision model |

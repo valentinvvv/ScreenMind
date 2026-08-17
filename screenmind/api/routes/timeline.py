@@ -140,6 +140,27 @@ async def reanalyze_activity(activity_id: int):
                 except Exception as e:
                     organized_text = ""  # Non-fatal — skip layout on error
 
+            # Scene description via the text-only model — from OCR text,
+            # never the screenshot. Overwrites the vision model's scene
+            # when it produces one; on failure the vision scene stays.
+            try:
+                text_scene = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: analyzer.generate_scene_from_text(
+                            ocr_text=ocr_text,
+                            organized_text=organized_text,
+                            app_name=app_name,
+                            window_title=window_title,
+                        ),
+                    ),
+                    timeout=60,
+                )
+            except Exception:
+                text_scene = None  # Non-fatal — vision scene (if any) stays
+            if text_scene:
+                record.scene_description = text_scene
+
             # Generate embedding for semantic search
             embedding = None
             try:
@@ -179,3 +200,17 @@ async def reanalyze_activity(activity_id: int):
             raise  # Re-raise timeout 504
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Re-analysis failed: {str(e)[:200]}")
+
+
+@router.post("/timeline/backfill")
+async def backfill_timeline(limit: int = Query(default=100, ge=1, le=500)):
+    """Manually backfill unanalyzed/skipped/failed activities.
+
+    Unlike the idle-loop backfill: no 24h window, no cooldown, oldest
+    rows first. Starts a background batch and returns immediately —
+    progress is visible via GET /api/status (analysis.backfill).
+    """
+    from screenmind.api import dependencies as deps
+    if deps.analysis_worker is None:
+        raise HTTPException(status_code=503, detail="Analysis worker not available")
+    return deps.analysis_worker.start_backfill_batch(limit=limit)
