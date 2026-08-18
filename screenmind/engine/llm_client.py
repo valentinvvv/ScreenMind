@@ -329,11 +329,24 @@ def chat(
         # chat_template_kwargs is vLLM's knob; other servers ignore it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
-    # Create a dedicated client per attempt so each can be closed independently
-    attempts = ["secondary", "primary"] if (use_text_model or use_vision_model) else ["primary"]
+    # Create a dedicated client per attempt so each can be closed independently.
+    # Some secondary endpoints (e.g. OpenVINO GenAI wrappers) reject stream=True
+    # with 400 — retry them without streaming before giving up on the model.
+    if use_text_model or use_vision_model:
+        attempts = ["secondary", "primary"]
+        if stream_callback is not None:
+            attempts.insert(1, "secondary-nostream")
+    else:
+        attempts = ["primary"]
     last_exc = None
     for attempt in attempts:
-        if attempt == "primary" and attempts[0] == "secondary":
+        if attempt == "secondary-nostream":
+            payload.pop("stream", None)
+            logger.info(
+                f"{'Text' if use_text_model else 'Vision'} endpoint rejected streaming "
+                f"({type(last_exc).__name__}) — retrying without streaming"
+            )
+        elif attempt == "primary" and attempts[0] == "secondary":
             # Secondary endpoint failed — retry on the primary backend
             url, headers = _endpoint("primary")
             if use_text_model:
@@ -349,19 +362,26 @@ def chat(
         with _client_lock:
             _active_client = client
         try:
-            if stream_callback is not None:
+            if stream_callback is not None and payload.get("stream"):
                 return _stream_chat(client, url, payload, headers, stream_callback)
             response = client.post(url, json=payload, headers=headers)
             _raise_with_detail(response)
             data = response.json()
-            return _extract_content(data)
+            text = _extract_content(data)
+            if stream_callback is not None and text:
+                # Non-streaming fallback — deliver the full text as one chunk
+                try:
+                    stream_callback(text)
+                except Exception:
+                    pass
+            return text
         except Exception as e:
             last_exc = e
             # Check if this was a cancellation (flag set + connection error)
             if _cancel_event.is_set():
                 raise InferenceCancelled("Inference cancelled for chat priority") from e
-            if attempt == "secondary":
-                continue  # try the primary endpoint
+            if attempt != "primary":
+                continue  # try the next attempt (no-stream retry or primary)
             raise
         finally:
             with _client_lock:
