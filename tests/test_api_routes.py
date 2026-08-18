@@ -1,5 +1,6 @@
 """Tests for API endpoints — uses httpx AsyncClient with the FastAPI app."""
 
+import asyncio
 import json
 import pytest
 from datetime import datetime
