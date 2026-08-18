@@ -217,7 +217,7 @@ class TestBackfillFailureLoop:
 
     async def test_failed_row_gets_cooldown(self):
         """Row still failing after backfill enters cooldown (no 2s retry loop)."""
-        row = (450, __file__, "Jump List", "ShellExperienceHost", None, None)
+        row = (450, __file__, "Jump List", "ShellExperienceHost", None, None, "2026-08-18 07:00:00")
         worker = self._worker([row], "Analysis failed")
         p1, p2 = self._patch_image_load()
         with p1, p2:
@@ -228,7 +228,8 @@ class TestBackfillFailureLoop:
 
     async def test_row_in_cooldown_is_skipped(self):
         """A cooling-down row is skipped; the next candidate is processed."""
-        row1 = (450, __file__, "t1", "app1", None, None)
+        row1 = (450, __file__, "t1", "app1", None, None, "2026-08-18 07:00:00")
+        row2 = (451, __file__, "t2", "app2", None, None, "2026-08-18 07:01:00")
         row2 = (451, __file__, "t2", "app2", None, None)
         worker = self._worker([row1, row2], "Analysis failed")
         worker._backfill_cooldown[450] = time.time()  # fresh cooldown
@@ -241,7 +242,7 @@ class TestBackfillFailureLoop:
 
     async def test_all_rows_cooling_down_is_noop(self):
         """When every candidate is cooling down, nothing is processed."""
-        row = (450, __file__, "t", "app", None, None)
+        row = (450, __file__, "t", "app", None, None, "2026-08-18 07:00:00")
         worker = self._worker([row], "Analysis failed")
         worker._backfill_cooldown[450] = time.time()
         p1, p2 = self._patch_image_load()
@@ -252,7 +253,7 @@ class TestBackfillFailureLoop:
 
     async def test_successful_backfill_clears_cooldown(self):
         """A real summary after backfill clears the cooldown for that row."""
-        row = (450, __file__, "t", "app", None, None)
+        row = (450, __file__, "t", "app", None, None, "2026-08-18 07:00:00")
         worker = self._worker([row], "Reading documentation on GitHub")
         worker._backfill_cooldown[450] = time.time() - 700  # expired cooldown
         p1, p2 = self._patch_image_load()
@@ -264,7 +265,7 @@ class TestBackfillFailureLoop:
 
     async def test_backfill_exception_sets_cooldown(self):
         """An exception during backfill also backs off instead of looping."""
-        row = (450, __file__, "t", "app", None, None)
+        row = (450, __file__, "t", "app", None, None, "2026-08-18 07:00:00")
         worker = self._worker([row], "Analysis failed")
         p1, p2 = self._patch_image_load()
         with p1, p2:

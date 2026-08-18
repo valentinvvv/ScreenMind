@@ -143,7 +143,14 @@ class TestAnalysisStreamEndpoint:
             it = resp.body_iterator
             task = _asyncio.create_task(_publish_soon())
             ev = None
-            async with _asyncio.timeout(5):
+            try:
+                while True:
+                    line = await asyncio.wait_for(it.__anext__(), timeout=5.0)
+                    if line.startswith("data:"):
+                        ev = json.loads(line.removeprefix("data:").strip())
+                        break
+            except asyncio.TimeoutError:
+                pytest.fail("Timeout waiting for SSE event")
                 while True:
                     line = await it.__anext__()
                     if line.startswith("data:"):
