@@ -133,6 +133,14 @@ class AnalysisWorker:
         # Prevents hammering the same row every 2s when analysis keeps failing.
         self._backfill_cooldown: dict = {}
 
+        # ── Live status: what is being processed right now ──────────────
+        # Snapshot dict consumed by GET /api/analysis/stream (SSE) and
+        # /api/status. Mutated from executor threads via stream callbacks —
+        # all consumer delivery goes through the event loop (call_soon_threadsafe).
+        self._current: Optional[dict] = None
+        self._subscribers: set = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
     def _ensure_embedder(self):
         """Lazy-load the embedding model."""
         if self._embedder is None and self._embedder_available:
@@ -143,9 +151,93 @@ class AnalysisWorker:
                 logger.warning(f"Embedder unavailable: {e}")
                 self._embedder_available = False
 
+    # ── Live status: publish/subscribe ─────────────────────────────────
+
+    def subscribe(self) -> asyncio.Queue:
+        """Register an SSE consumer. Returns a queue receiving live events."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._subscribers.discard(q)
+
+    def _publish(self, event: dict):
+        """Broadcast an event to all subscribers. Thread-safe: stream
+        callbacks fire on executor threads, delivery happens on the loop."""
+        loop = self._loop
+        if loop is None or not self._subscribers:
+            return
+        for q in list(self._subscribers):
+            try:
+                loop.call_soon_threadsafe(self._enqueue, q, event)
+            except RuntimeError:
+                pass  # loop closed during shutdown
+
+    @staticmethod
+    def _enqueue(q: asyncio.Queue, event: dict):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            # Slow consumer — drop its oldest event, keep the freshest state
+            try:
+                q.get_nowait()
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+    def _begin_current(self, activity_id: int, capture: CaptureResult):
+        day_number = None
+        try:
+            day_number = self._db.get_day_number(activity_id)
+        except Exception:
+            pass
+        self._current = {
+            "activity_id": activity_id,
+            "day_number": day_number,
+            "date": capture.timestamp.strftime("%Y-%m-%d"),
+            "app_name": capture.app_name or "unknown",
+            "stage": "processing",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "response": "",
+            "summary": None,
+            "queue_size": self._queue.qsize(),
+        }
+        self._publish({"type": "status", **self._current})
+
+    def _set_stage(self, stage: str):
+        if self._current is None:
+            return
+        self._current["stage"] = stage
+        self._current["response"] = ""  # each stage streams fresh model output
+        self._current["queue_size"] = self._queue.qsize()
+        self._publish({"type": "status", **self._current})
+
+    def _stream_chunk(self, chunk: str):
+        """LLM stream callback — runs on an executor thread."""
+        if self._current is None or not chunk:
+            return
+        self._current["response"] += chunk
+        self._publish({"type": "delta", "text": chunk})
+
+    def _finish_current(self, stage: str, summary: Optional[str] = None):
+        if self._current is None:
+            return
+        self._current["stage"] = stage
+        if summary is not None:
+            self._current["summary"] = summary
+        self._current["queue_size"] = self._queue.qsize()
+        self._publish({"type": "status", **self._current})
+
+    @property
+    def current_status(self) -> Optional[dict]:
+        """Snapshot of the item being processed (or last finished one)."""
+        return dict(self._current) if self._current else None
+
     async def run(self):
         """Main processing loop."""
         self._running = True
+        self._loop = asyncio.get_event_loop()
 
         # Pre-load embedder in background
         await asyncio.get_event_loop().run_in_executor(None, self._ensure_embedder)
@@ -268,6 +360,7 @@ class AnalysisWorker:
 
         try:
             logger.info(f"Processing #{activity_id} ({capture.app_name or 'unknown'})...")
+            self._begin_current(activity_id, capture)
 
             # 2. Per-app cache check — skip OCR + Gemma for identical screens
             #    Compare pHash against last analyzed frame for same (app, title).
@@ -313,6 +406,7 @@ class AnalysisWorker:
                 logger.info(f"#{self._processed} in {elapsed:.1f}s: "
                       f"{cached['analysis'].app_name} ({cached['analysis'].activity_category}) "
                       f"[cache: identical]")
+                self._finish_current("done", summary=cached["analysis"].activity_summary)
                 return
 
             # 3. Text extraction (only for minor/full tiers)
@@ -352,6 +446,7 @@ class AnalysisWorker:
             # 3b. OCR — runs when a11y text is chrome-only or insufficient.
             #     Serial and CPU-bound: it gates both LLM calls, so its cost
             #     is surfaced in the completion log below.
+            self._set_stage("ocr")
             needs_ocr = not a11y_is_content or text_method == "none"
             ocr_elapsed = 0.0
             if needs_ocr and self._ocr.is_available:
@@ -424,6 +519,7 @@ class AnalysisWorker:
             else:
                 # --- Tier "full": run Gemma analysis + layout detection ---
                 tier_label = "full"
+                self._set_stage("analyzing")
 
                 async def _run_analysis():
                     """Gemma 4 analysis + layout with smart OOM retry."""
@@ -445,6 +541,7 @@ class AnalysisWorker:
                                     app_name_hint=capture.app_name,
                                     ocr_text=ocr_text,
                                     active_urls=found_urls,
+                                    stream_callback=self._stream_chunk,
                                 ),
                             )
                         except InferenceCancelled:
@@ -469,6 +566,7 @@ class AnalysisWorker:
                 result = await _run_analysis()
 
                 if result is None:
+                    self._finish_current("requeued")
                     return  # Re-queued or fatal
 
                 analysis, layout_regions = result
@@ -488,7 +586,7 @@ class AnalysisWorker:
                 if _missing and not getattr(capture, '_quality_retried', False):
                     capture._quality_retried = True
                     logger.debug(f"Missing fields ({', '.join(_missing)}) — retrying analysis...")
-                    await asyncio.sleep(1)
+                    self._set_stage("analyzing")
                     retry_result = await _run_analysis()
                     if retry_result:
                         retry_analysis, retry_regions = retry_result
@@ -669,17 +767,20 @@ class AnalysisWorker:
                 parts.append("[*]")
 
             logger.info(" ".join(parts))
+            self._finish_current("done", summary=analysis.activity_summary)
 
         except InferenceCancelled:
             # Chat pre-empted this analysis — re-queue at front, not an error
             elapsed = time.time() - start
             self._priority_items.append(capture)
             logger.info(f"Yielded to chat after {elapsed:.1f}s, re-queued at front (priority: {len(self._priority_items)})")
+            self._finish_current("yielded")
 
         except Exception as e:
             elapsed = time.time() - start
             self._errors += 1
             logger.error(f"Failed after {elapsed:.1f}s: {e}")
+            self._finish_current("failed", summary=f"Analysis failed: {str(e)[:100]}")
 
             self._db.update_activity_analysis(
                 activity_id=activity_id,
@@ -716,7 +817,7 @@ class AnalysisWorker:
 
         conn = self._db._get_conn()
         rows = conn.execute(
-            """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes
+            """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes, timestamp
                FROM activities
                WHERE (analyzed = 0
                   OR summary = 'Skipped (analysis backlog)'
@@ -758,7 +859,7 @@ class AnalysisWorker:
         try:
             conn = self._db._get_conn()
             rows = conn.execute(
-                """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes
+                """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes, timestamp
                    FROM activities
                    WHERE (analyzed = 0
                       OR summary = 'Skipped (analysis backlog)'
@@ -791,7 +892,7 @@ class AnalysisWorker:
 
     async def _backfill_row(self, row, conn) -> str:
         """Backfill a single row. Returns 'done', 'failed', or 'skipped'."""
-        activity_id, ss_path, window_title, app_name, _ocr_text, _ocr_boxes_raw = row
+        activity_id, ss_path, window_title, app_name, _ocr_text, _ocr_boxes_raw, original_timestamp = row
         try:
             # Check screenshot still exists on disk
             if not ss_path or not Path(ss_path).exists():
@@ -805,7 +906,6 @@ class AnalysisWorker:
                 return "skipped"
 
             logger.info(f"Backfilling #{activity_id} ({app_name})...")
-
             # Load image and create a minimal CaptureResult
             try:
                 from screenmind.privacy.encryption import open_image
@@ -824,9 +924,15 @@ class AnalysisWorker:
             import imagehash
             phash = imagehash.phash(img)
 
+            # Parse the original timestamp from the database
+            try:
+                capture_time = datetime.fromisoformat(original_timestamp)
+            except (ValueError, TypeError):
+                capture_time = datetime.now()  # Fallback if parsing fails
+
             capture = CaptureResult(
                 filepath=Path(ss_path),
-                timestamp=datetime.now(),  # Use now — it's no longer stale
+                timestamp=capture_time,  # Preserve original capture time
                 window_title=window_title,
                 app_name=app_name,
                 bookmarked=False,
@@ -1009,6 +1115,7 @@ class AnalysisWorker:
             "cache_size": len(self._app_cache),
             "backfill": dict(self._backfill_status),
             "scenes": dict(self._scene_backfill_status),
+            "current": self.current_status,
         }
 
     def backfill_running(self) -> bool:

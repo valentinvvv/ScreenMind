@@ -245,7 +245,65 @@ async function renderSettings(el) {
   + '<div class="settings-note">Key stored in OS keyring. Requires <code>pip install cryptography keyring</code>.</div></div>'
 
   + '</div>'
-  + '<button class="btn btn-primary settings-save" id="save-settings" onclick="saveSettings()">Save Settings</button>';
+  + '<button class="btn btn-primary settings-save" id="save-settings" onclick="saveSettings()">Save Settings</button>'
+  + '<div class="settings-version" onclick="toggleApiList()" style="cursor:pointer">ScreenMind v' + (cfg.version || '') + ' <span style="font-size:0.7rem;opacity:0.6">▼</span></div>'
+  + '<div id="api-list" class="api-list" style="display:none">'
+  + '<div class="api-list-title">API Endpoints</div>'
+  + '<div class="api-endpoint">GET /api/status</div>'
+  + '<div class="api-endpoint">GET /api/settings</div>'
+  + '<div class="api-endpoint">POST /api/settings</div>'
+  + '<div class="api-endpoint">GET /api/timeline</div>'
+  + '<div class="api-endpoint">GET /api/timeline/{date}</div>'
+  + '<div class="api-endpoint">GET /api/activities/{id}</div>'
+  + '<div class="api-endpoint">DELETE /api/activities/{id}</div>'
+  + '<div class="api-endpoint">POST /api/activities/{id}/reanalyze</div>'
+  + '<div class="api-endpoint">GET /api/analysis/stream</div>'
+  + '<div class="api-endpoint">GET /api/search</div>'
+  + '<div class="api-endpoint">POST /api/chat</div>'
+  + '<div class="api-endpoint">GET /api/summary/{date}</div>'
+  + '<div class="api-endpoint">POST /api/summary/generate</div>'
+  + '<div class="api-endpoint">POST /api/standup/generate</div>'
+  + '<div class="api-endpoint">GET /api/meetings</div>'
+  + '<div class="api-endpoint">GET /api/meetings/{id}</div>'
+  + '<div class="api-endpoint">DELETE /api/meetings/{id}</div>'
+  + '<div class="api-endpoint">POST /api/meetings/{id}/reanalyze</div>'
+  + '<div class="api-endpoint">GET /api/screenshots/{id}</div>'
+  + '<div class="api-endpoint">GET /api/bookmarks</div>'
+  + '<div class="api-endpoint">POST /api/capture/bookmark</div>'
+  + '<div class="api-endpoint">POST /api/capture/pause</div>'
+  + '<div class="api-endpoint">POST /api/capture/resume</div>'
+  + '<div class="api-endpoint">POST /api/incognito/toggle</div>'
+  + '<div class="api-endpoint">POST /api/timeline/backfill</div>'
+  + '<div class="api-endpoint">POST /api/timeline/scenes/backfill</div>'
+  + '<div class="api-endpoint">DELETE /api/timeline/clear</div>'
+  + '<div class="api-endpoint">DELETE /api/activities/before/{date}</div>'
+  + '<div class="api-endpoint">GET /api/models</div>'
+  + '<div class="api-endpoint">POST /api/models/pull</div>'
+  + '<div class="api-endpoint">POST /api/models/switch</div>'
+  + '<div class="api-endpoint">POST /api/models/restart</div>'
+  + '<div class="api-endpoint">POST /api/models/cancel</div>'
+  + '<div class="api-endpoint">POST /api/models/variant</div>'
+  + '<div class="api-endpoint">POST /api/models/delete</div>'
+  + '<div class="api-endpoint">POST /api/llm/test</div>'
+  + '<div class="api-endpoint">POST /api/integrations/test</div>'
+  + '<div class="api-endpoint">GET /api/startup/status</div>'
+  + '<div class="api-endpoint">POST /api/startup/install</div>'
+  + '<div class="api-endpoint">POST /api/startup/uninstall</div>'
+  + '<div class="api-endpoint">POST /api/shutdown</div>'
+  + '<div class="api-endpoint">GET /api/agents</div>'
+  + '<div class="api-endpoint">POST /api/agents/{name}/toggle</div>'
+  + '<div class="api-endpoint">POST /api/agents/{name}/run</div>'
+  + '<div class="api-endpoint">POST /api/agents/{name}/approve</div>'
+  + '<div class="api-endpoint">DELETE /api/agents/{name}</div>'
+  + '<div class="api-endpoint">GET /api/agents/{name}/outputs</div>'
+  + '<div class="api-endpoint">POST /api/agents/create</div>'
+  + '<div class="api-endpoint">PUT /api/agents/{name}/content</div>'
+  + '<div class="api-endpoint">POST /api/agents/{name}/open</div>'
+  + '<div class="api-endpoint">POST /api/auth/setup-complete</div>'
+  + '<div class="api-endpoint">POST /api/auth/verify</div>'
+  + '<div class="api-endpoint">POST /api/auth/set-pin</div>'
+  + '<div class="api-endpoint">POST /api/auth/logout</div>'
+  + '</div>';
 
   // Radio button visual toggle
   el.querySelectorAll('.radio-pill input').forEach(function(radio) {
@@ -800,6 +858,13 @@ window.loadWebhookLog = async function() {
     logEl.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid rgba(255,255,255,0.1)"><th style="padding:4px 8px;text-align:left;font-size:0.72rem;color:var(--text-muted)"></th><th style="text-align:left;font-size:0.72rem;color:var(--text-muted);padding:4px 8px">Time</th><th style="text-align:left;font-size:0.72rem;color:var(--text-muted);padding:4px 8px">Event</th><th style="text-align:left;font-size:0.72rem;color:var(--text-muted);padding:4px 8px">URL</th><th style="text-align:left;font-size:0.72rem;color:var(--text-muted);padding:4px 8px">Status</th></tr></thead><tbody id="log-tbody">' + rows + '</tbody></table>';
   } catch (e) {
     logEl.innerHTML = '<span style="color:#ef4444">Failed to load: ' + e.message + '</span>';
+  }
+};
+
+window.toggleApiList = function() {
+  var apiList = document.getElementById('api-list');
+  if (apiList) {
+    apiList.style.display = apiList.style.display === 'none' ? 'block' : 'none';
   }
 };
 

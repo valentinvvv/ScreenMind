@@ -341,12 +341,18 @@ class Database:
     def get_activities_by_date(
         self, target_date: str, limit: int = 200, offset: int = 0
     ) -> List[Dict[str, Any]]:
-        """Get all activities for a specific date (YYYY-MM-DD)."""
+        """Get all activities for a specific date (YYYY-MM-DD).
+
+        Each row carries day_number — its 1-based chronological position
+        within the day (stable across pagination: computed over the whole
+        day before LIMIT/OFFSET).
+        """
         conn = self._get_conn()
         rows = conn.execute(
             """
             SELECT a.*, d.repo_name, d.branch, d.last_commit,
-                   d.changed_files, d.insertions, d.deletions
+                   d.changed_files, d.insertions, d.deletions,
+                   ROW_NUMBER() OVER (ORDER BY a.timestamp ASC, a.id ASC) AS day_number
             FROM activities a
             LEFT JOIN dev_contexts d ON d.activity_id = a.id
             WHERE DATE(a.timestamp) = ?
@@ -356,6 +362,33 @@ class Database:
             (target_date, limit, offset),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def count_activities_by_date(self, target_date: str) -> int:
+        """Total activities for a date — feeds timeline pagination."""
+        conn = self._get_conn()
+        return conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE DATE(timestamp) = ?",
+            (target_date,),
+        ).fetchone()[0]
+
+    def get_day_number(self, activity_id: int) -> Optional[int]:
+        """Chronological 1-based position of an activity within its day.
+
+        None if the activity no longer exists. Ties on timestamp break by id
+        so every row gets a unique, stable number.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM activities a
+            WHERE DATE(a.timestamp) = (SELECT DATE(timestamp) FROM activities WHERE id = ?)
+              AND (a.timestamp < (SELECT timestamp FROM activities WHERE id = ?)
+                   OR (a.timestamp = (SELECT timestamp FROM activities WHERE id = ?)
+                       AND a.id <= ?))
+            """,
+            (activity_id, activity_id, activity_id, activity_id),
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
     def get_activity_by_id(self, activity_id: int) -> Optional[Dict[str, Any]]:
         """Get a single activity by ID."""

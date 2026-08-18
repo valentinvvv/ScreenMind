@@ -225,3 +225,59 @@ def test_update_scene_description_syncs_fts(db):
         "SELECT rowid FROM activities_fts WHERE activities_fts MATCH 'uniquekeyword_xyzzy'"
     ).fetchall()
     assert [r[0] for r in hit] == [aid]
+
+
+def _seed_day(db, hours):
+    """Insert activities at given hours on 2026-05-16; return ids in order."""
+    return [
+        db.insert_activity(ScreenshotEntry(
+            timestamp=datetime(2026, 5, 16, h, 0, 0),
+            screenshot_path=f"/tmp/day_{h}.jpg",
+            analyzed=False,
+        ))
+        for h in hours
+    ]
+
+
+def test_day_number_chronological_within_day(db):
+    """day_number counts events 1..N in chronological order, newest row first."""
+    _seed_day(db, [9, 10, 11])
+    acts = db.get_activities_by_date("2026-05-16")
+    assert len(acts) == 3
+    # Rows come back DESC by time; numbers must still be 1,2,3 chronologically
+    assert [a["day_number"] for a in acts] == [3, 2, 1]
+
+
+def test_day_number_scoped_to_date(db):
+    """Numbers restart at 1 for each day."""
+    _seed_day(db, [9, 10])
+    db.insert_activity(ScreenshotEntry(
+        timestamp=datetime(2026, 5, 17, 9, 0, 0),
+        screenshot_path="/tmp/next.jpg",
+        analyzed=False,
+    ))
+    acts = db.get_activities_by_date("2026-05-17")
+    assert [a["day_number"] for a in acts] == [1]
+
+
+def test_day_number_stable_across_pages(db):
+    """Pagination must not shift numbers — computed over the whole day."""
+    _seed_day(db, [8, 9, 10, 11])
+    page2 = db.get_activities_by_date("2026-05-16", limit=2, offset=2)
+    assert [a["day_number"] for a in page2] == [2, 1]
+
+
+def test_count_activities_by_date(db):
+    _seed_day(db, [9, 10, 11])
+    assert db.count_activities_by_date("2026-05-16") == 3
+    assert db.count_activities_by_date("2099-01-01") == 0
+
+
+def test_get_day_number(db):
+    ids = _seed_day(db, [9, 10, 11])
+    assert db.get_day_number(ids[0]) == 1
+    assert db.get_day_number(ids[2]) == 3
+
+
+def test_get_day_number_missing_activity(db):
+    assert db.get_day_number(99999) is None

@@ -1,5 +1,6 @@
 """Tests for API endpoints — uses httpx AsyncClient with the FastAPI app."""
 
+import json
 import pytest
 from datetime import datetime
 from unittest.mock import patch
@@ -40,6 +41,118 @@ async def test_timeline_with_data(client, db):
     data = resp.json()
     assert len(data["activities"]) >= 1
     assert any(a["window_title"] == "Test Window" for a in data["activities"])
+
+
+@pytest.mark.asyncio
+async def test_timeline_total_ignores_limit_offset(client, db):
+    """total counts the whole day so the dashboard can paginate."""
+    from datetime import timedelta
+    base = datetime(2026, 5, 16, 10, 0, 0)
+    for i in range(5):
+        db.insert_activity(ScreenshotEntry(
+            timestamp=base + timedelta(minutes=i),
+            screenshot_path=f"/tmp/page_{i}.jpg",
+            analyzed=False,
+        ))
+
+    resp = await client.get("/api/timeline?date=2026-05-16&limit=2&offset=2")
+    data = resp.json()
+    assert len(data["activities"]) == 2
+    assert data["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_timeline_activities_carry_day_number(client, db):
+    """Each activity exposes its chronological day-scoped number."""
+    from datetime import timedelta
+    base = datetime(2026, 5, 16, 10, 0, 0)
+    for i in range(3):
+        db.insert_activity(ScreenshotEntry(
+            timestamp=base + timedelta(minutes=i),
+            screenshot_path=f"/tmp/num_{i}.jpg",
+            analyzed=False,
+        ))
+
+    resp = await client.get("/api/timeline?date=2026-05-16")
+    acts = resp.json()["activities"]
+    # DESC order — newest first carries the highest number
+    assert [a["day_number"] for a in acts] == [3, 2, 1]
+
+
+class TestAnalysisStreamEndpoint:
+    """GET /api/analysis/stream — SSE feed for the Timeline status panel."""
+
+    def _worker(self):
+        import asyncio as _asyncio
+        from unittest.mock import MagicMock
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        worker = AnalysisWorker(queue=_asyncio.Queue(), database=MagicMock())
+        return worker
+
+    @pytest.mark.asyncio
+    async def test_without_worker_returns_503(self, client):
+        deps.analysis_worker = None
+        resp = await client.get("/api/analysis/stream")
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_snapshot_sent_on_connect(self):
+        """An in-progress item is pushed immediately as a status event.
+
+        Consumes the StreamingResponse body_iterator directly — httpx's
+        ASGITransport buffers the whole body, which never completes for an
+        infinite SSE stream.
+        """
+        import asyncio as _asyncio
+        from screenmind.api.routes.timeline import analysis_stream
+        worker = self._worker()
+        worker._loop = _asyncio.get_event_loop()
+        worker._current = {
+            "activity_id": 7, "day_number": 3, "date": "2026-05-16",
+            "app_name": "Code", "stage": "analyzing",
+            "started_at": "2026-05-16T10:00:00", "response": "partial",
+            "summary": None, "queue_size": 0,
+        }
+        deps.analysis_worker = worker
+        try:
+            resp = await analysis_stream()
+            assert resp.media_type == "text/event-stream"
+            first = await _asyncio.wait_for(resp.body_iterator.__anext__(), timeout=5)
+            ev = json.loads(first.removeprefix("data:").strip())
+            assert ev["type"] == "status"
+            assert ev["activity_id"] == 7
+            assert ev["stage"] == "analyzing"
+        finally:
+            deps.analysis_worker = None
+
+    @pytest.mark.asyncio
+    async def test_live_events_reach_subscriber(self):
+        """Events published after connect stream out as SSE data lines."""
+        import asyncio as _asyncio
+        from screenmind.api.routes.timeline import analysis_stream
+        worker = self._worker()
+        worker._loop = _asyncio.get_event_loop()
+        deps.analysis_worker = worker
+
+        async def _publish_soon():
+            await _asyncio.sleep(0.05)
+            worker._publish({"type": "delta", "text": "hello"})
+
+        try:
+            resp = await analysis_stream()
+            it = resp.body_iterator
+            task = _asyncio.create_task(_publish_soon())
+            ev = None
+            async with _asyncio.timeout(5):
+                while True:
+                    line = await it.__anext__()
+                    if line.startswith("data:"):
+                        ev = json.loads(line.removeprefix("data:").strip())
+                        break
+            await task
+            assert ev == {"type": "delta", "text": "hello"}
+        finally:
+            deps.analysis_worker = None
 
 
 @pytest.mark.asyncio

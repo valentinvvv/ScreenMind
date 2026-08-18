@@ -260,6 +260,9 @@ function navigate(view) {
   currentView = view;
   window.location.hash = view;
 
+  // Close the timeline live-status stream when leaving the view
+  if (view !== 'timeline' && typeof onTimelineLeave === 'function') onTimelineLeave();
+
   // Close Model Hub overlay on navigation
   closeModelHub();
 

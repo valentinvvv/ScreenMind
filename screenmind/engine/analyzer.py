@@ -327,6 +327,7 @@ class GemmaAnalyzer:
         app_name_hint: Optional[str] = None,
         ocr_text: Optional[str] = None,
         active_urls: Optional[list] = None,
+        stream_callback=None,
     ):
         """
         Analyze a screenshot and detect layout in a single merged call.
@@ -367,6 +368,7 @@ class GemmaAnalyzer:
                 images=[image_bytes],
                 temperature=0.0,
                 max_tokens=1800,
+                stream_callback=stream_callback,
             )
 
             elapsed = time.time() - start_time
@@ -457,6 +459,7 @@ class GemmaAnalyzer:
         app_name_hint: Optional[str] = None,
         ocr_text: Optional[str] = None,
         active_urls: Optional[list] = None,
+        stream_callback=None,
     ):
         """
         Balanced mode: analysis with thinking (no layout), ~40-50s.
@@ -499,6 +502,7 @@ class GemmaAnalyzer:
                     images=[image_bytes],
                     temperature=0.0 if attempt == 0 else 0.1,
                     max_tokens=2048,
+                    stream_callback=stream_callback,
                 )
 
                 elapsed = time.time() - start_time
@@ -536,6 +540,7 @@ class GemmaAnalyzer:
         app_name_hint: Optional[str] = None,
         ocr_text: Optional[str] = None,
         active_urls: Optional[list] = None,
+        stream_callback=None,
     ):
         """
         Fast mode: analysis only (no thinking), ~12s. Layout done via OCR clustering.
@@ -578,6 +583,7 @@ class GemmaAnalyzer:
                     messages=messages,
                     temperature=0.0 if attempt == 0 else 0.1,
                     max_tokens=500,
+                    stream_callback=stream_callback,
                 )
                 elapsed = time.time() - start_time
                 logger.info(f"Fast analysis done in {elapsed:.1f}s")

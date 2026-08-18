@@ -4,6 +4,7 @@ import sys
 
 from fastapi import APIRouter, Request
 
+from screenmind import __version__
 from screenmind.config import settings
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -66,6 +67,7 @@ async def get_settings():
         "pause_hotkey": settings.pause_hotkey,
         "voice_hotkey": settings.voice_hotkey,
         "capture_active_monitor": settings.capture_active_monitor,
+        "version": __version__,
     }
 
 

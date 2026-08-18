@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
+from starlette.responses import StreamingResponse
 
 from screenmind.config import settings
 from screenmind.api.dependencies import db
@@ -22,15 +23,61 @@ async def get_timeline(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    """Get activities for a specific date, optionally filtered by since timestamp."""
+    """Get activities for a specific date, optionally filtered by since timestamp.
+
+    Returns total (count for the whole day, ignoring limit/offset) so the
+    dashboard can paginate. Each activity carries day_number — its
+    chronological position within the day (e.g. 2026-08-17_42).
+    """
     target_date = date or str(__import__("datetime").date.today())
     activities = db.get_activities_by_date(target_date, limit=limit, offset=offset)
+    total = db.count_activities_by_date(target_date)
     if since:
         activities = [a for a in activities if a.get("timestamp", "") >= since]
     for a in activities:
         if a.get("screenshot_path"):
             a["screenshot_url"] = f"/api/screenshot/{a['id']}"
-    return {"date": target_date, "activities": activities}
+    return {"date": target_date, "activities": activities, "total": total}
+
+
+@router.get("/analysis/stream")
+async def analysis_stream():
+    """SSE stream of live analysis progress for the Timeline status panel.
+
+    Events:
+      status — full snapshot of the item being processed (stage, day_number,
+               accumulated model response, summary). Sent on connect and on
+               every stage transition.
+      delta  — incremental model output during the analyzing stage.
+
+    A keepalive comment goes out every 15s so proxies don't drop the socket.
+    """
+    from screenmind.api import dependencies as deps
+    if deps.analysis_worker is None:
+        raise HTTPException(status_code=503, detail="Analysis worker not available")
+    worker = deps.analysis_worker
+
+    async def generate():
+        q = worker.subscribe()
+        try:
+            snapshot = worker.current_status
+            if snapshot:
+                yield f"data: {json.dumps({'type': 'status', **snapshot})}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            worker.unsubscribe(q)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/activity/{activity_id}")

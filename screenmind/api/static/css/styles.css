@@ -218,6 +218,59 @@ input:focus, select:focus { border-color: var(--border-active); box-shadow: 0 0 
 .timeline-item .summary { font-size: 0.85rem; color: var(--text-secondary); line-height: 1.5; }
 .timeline-item .dev-ctx { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.8rem; color: var(--cat-coding); }
 
+/* ── Day-scoped event number badge ────────────────────── */
+.day-num {
+  font-size: 0.68rem; font-weight: 600; color: var(--text-muted);
+  background: rgba(139,92,246,0.10); border: 1px solid rgba(139,92,246,0.22);
+  padding: 1px 7px; border-radius: 8px; font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Live analysis status panel ───────────────────────── */
+.tl-status-panel {
+  display: flex; gap: 14px; align-items: stretch; padding: 12px 14px;
+  margin-bottom: 16px;
+  background: linear-gradient(135deg, rgba(139,92,246,0.10), rgba(192,132,252,0.05));
+  border: 1px solid rgba(139,92,246,0.30);
+  border-radius: var(--radius-md);
+  animation: chatFadeIn 0.3s ease;
+}
+.tl-status-thumb {
+  width: 96px; height: 54px; border-radius: var(--radius-sm);
+  object-fit: cover; flex-shrink: 0; background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+.tl-status-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.tl-status-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tl-status-stage { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
+.tl-status-app { font-size: 0.8rem; color: var(--text-secondary); }
+.tl-status-queue { font-size: 0.72rem; color: var(--text-muted); margin-left: auto; }
+.tl-status-response {
+  font-size: 0.78rem; color: var(--text-secondary); line-height: 1.5;
+  max-height: 96px; overflow-y: auto; white-space: pre-wrap;
+  overflow-wrap: break-word; word-break: break-word;
+  background: rgba(0,0,0,0.18); border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+.tl-status-response:empty { display: none; }
+
+/* ── Timeline pagination ──────────────────────────────── */
+.tl-pagination {
+  display: flex; align-items: center; justify-content: center; gap: 16px;
+  margin-top: 20px; padding: 12px 0;
+}
+.tl-page-info { font-size: 0.85rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tl-page-input {
+  width: 50px; padding: 4px 8px; text-align: center;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text-primary); font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+.tl-page-input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(139,92,246,0.2);
+}
+
 /* ── Three-dot Menu (⋮) ───────────────────────────────── */
 .card-menu-wrap {
   position: relative; flex-shrink: 0;
@@ -922,6 +975,12 @@ mark {
   font-size: 0.9rem; font-weight: 600;
 }
 
+.settings-version {
+  margin-top: 14px; text-align: center;
+  font-size: 0.75rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Meeting Transcription Accent Card */
 .settings-card-accent {
   border-color: rgba(236, 72, 153, 0.2);
@@ -1402,4 +1461,51 @@ mark {
 }
 .mh-footer a { color: var(--accent); cursor: pointer; text-decoration: none; }
 .mh-footer a:hover { text-decoration: underline; }
+
+/* ── Settings Version & API List ────────────────────────── */
+.settings-version {
+  margin-top: 20px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+.settings-version:hover {
+  color: var(--accent);
+}
+
+.api-list {
+  margin-top: 12px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.api-list-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.api-endpoint {
+  font-family: 'Monaco', 'Consolas', monospace;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  padding: 6px 10px;
+  margin: 4px 0;
+  background: rgba(139, 92, 246, 0.08);
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.api-endpoint:hover {
+  background: rgba(139, 92, 246, 0.15);
+  color: var(--text-primary);
+}
 

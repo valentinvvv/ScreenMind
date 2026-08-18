@@ -15,7 +15,7 @@ import json
 import logging
 import threading
 import time
-from typing import Optional, List
+from typing import Callable, Optional, List
 
 import httpx
 
@@ -256,6 +256,7 @@ def chat(
     temperature: float = 0.1,
     max_tokens: int = 1024,
     timeout: float = INFERENCE_TIMEOUT,
+    stream_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
     Send a chat completion request to the active inference backend.
@@ -269,6 +270,10 @@ def chat(
     ]}]
 
     Raises InferenceCancelled if cancel_current_inference() is called during request.
+
+    When stream_callback is provided, the request uses SSE streaming and the
+    callback receives each content delta as it arrives. The return value is
+    unchanged: the full accumulated assistant text.
     Returns the assistant's response text.
     """
     global _active_client
@@ -302,6 +307,8 @@ def chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if stream_callback is not None:
+        payload["stream"] = True
     if use_text_model or use_vision_model or _is_custom_backend():
         # OpenAI-compatible APIs require the model identifier in the payload
         payload["model"] = (
@@ -337,6 +344,8 @@ def chat(
         with _client_lock:
             _active_client = client
         try:
+            if stream_callback is not None:
+                return _stream_chat(client, url, payload, headers, stream_callback)
             response = client.post(url, json=payload, headers=headers)
             _raise_with_detail(response)
             data = response.json()
@@ -360,6 +369,61 @@ def chat(
     raise last_exc  # unreachable — every attempt returns or raises
 
 
+def _extract_delta(data) -> str:
+    """Extract one streamed content delta from an OpenAI-style chat chunk.
+
+    Returns "" for chunks without content (role markers, finish signals,
+    reasoning-only frames) — never raises on malformed chunks.
+    """
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    delta = choice.get("delta") if isinstance(choice, dict) else None
+    content = delta.get("content") if isinstance(delta, dict) else None
+    return content if isinstance(content, str) else ""
+
+
+def _stream_chat(
+    client: httpx.Client,
+    url: str,
+    payload: dict,
+    headers: dict,
+    stream_callback: Callable[[str], None],
+) -> str:
+    """Execute a streaming chat completion; returns the accumulated text.
+
+    The caller owns the client lifecycle (registration as _active_client,
+    close, cancellation handling) — this only drives the SSE read loop.
+    """
+    parts: List[str] = []
+    with client.stream("POST", url, json=payload, headers=headers) as response:
+        if response.status_code >= 400:
+            response.read()  # body needed for the error detail
+            _raise_with_detail(response)
+        for line in response.iter_lines():
+            if _cancel_event.is_set():
+                raise InferenceCancelled("Inference cancelled for chat priority")
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            delta = _extract_delta(chunk)
+            if not delta:
+                continue
+            parts.append(delta)
+            try:
+                stream_callback(delta)
+            except Exception as cb_err:
+                logger.debug(f"Stream callback error (non-fatal): {cb_err}")
+    return "".join(parts)
+
+
 def chat_with_images(
     prompt: str,
     images: List[bytes],
@@ -367,6 +431,7 @@ def chat_with_images(
     temperature: float = 0.1,
     max_tokens: int = 1024,
     timeout: float = INFERENCE_TIMEOUT,
+    stream_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
     Chat with image inputs. Convenience wrapper for vision calls.
@@ -391,7 +456,8 @@ def chat_with_images(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": content})
 
-    return chat(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+    return chat(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout,
+                stream_callback=stream_callback)
 
 
 def transcribe_audio(

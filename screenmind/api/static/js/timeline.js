@@ -1,7 +1,24 @@
 //  TIMELINE VIEW
 // ══════════════════════════════════════════════════════════
+const TL_PAGE_SIZE = 50;
+let _tlPage = 0;
+let _tlStatusES = null;
+let _tlStatusHideTimer = null;
+
 async function renderTimeline(el) {
   el.innerHTML = `
+    <div id="tl-status-panel" class="tl-status-panel" style="display:none">
+      <img class="tl-status-thumb" id="tl-status-thumb" alt="">
+      <div class="tl-status-body">
+        <div class="tl-status-top">
+          <span class="tl-status-stage" id="tl-status-stage"></span>
+          <span class="day-num" id="tl-status-daynum"></span>
+          <span class="tl-status-app" id="tl-status-app"></span>
+          <span class="tl-status-queue" id="tl-status-queue"></span>
+        </div>
+        <div class="tl-status-response" id="tl-status-response"></div>
+      </div>
+    </div>
     <div class="date-nav" style="margin-bottom:20px">
       <button class="btn btn-ghost btn-sm" id="prev-day">\u25c0</button>
       <input type="date" id="timeline-date" value="${currentDate}">
@@ -9,32 +26,58 @@ async function renderTimeline(el) {
       <span style="margin-left:12px;color:var(--text-muted);font-size:0.85rem" id="tl-count"></span>
       <button class="btn btn-ghost btn-sm" id="clear-timeline" style="margin-left:auto;color:#ef4444;font-size:0.8rem" title="Clear today's timeline">🗑 Clear Timeline</button>
     </div>
-    <div class="timeline" id="timeline-list"><div class="spinner"></div></div>`;
-  $('#timeline-date').addEventListener('change', e => { currentDate = e.target.value; loadTimeline(); });
+    <div class="timeline" id="timeline-list"><div class="spinner"></div></div>
+    <div class="tl-pagination" id="tl-pagination" style="display:none">
+      <button class="btn btn-ghost btn-sm" id="tl-prev-page">\u25c0 Prev</button>
+      <span class="tl-page-info">Page</span>
+      <input type="number" id="tl-page-input" class="tl-page-input" min="1" value="1">
+      <span class="tl-page-info">/ <span id="tl-total-pages">1</span></span>
+      <button class="btn btn-ghost btn-sm" id="tl-next-page">Next \u25b6</button>
+    </div>`;
+  $('#timeline-date').addEventListener('change', e => { currentDate = e.target.value; _tlPage = 0; loadTimeline(); });
   $('#prev-day').addEventListener('click', () => shiftDate(-1));
-  $('#next-day').addEventListener('click', () => shiftDate(1));
-  $('#clear-timeline').addEventListener('click', confirmClearTimeline);
+  $('#tl-prev-page').addEventListener('click', () => { if (_tlPage > 0) { _tlPage--; loadTimeline(); } });
+  $('#tl-next-page').addEventListener('click', () => { _tlPage++; loadTimeline(); });
+  $('#tl-page-input').addEventListener('change', e => {
+    const val = parseInt(e.target.value) - 1;
+    const totalPages = parseInt($('#tl-total-pages').textContent);
+    if (val >= 0 && val < totalPages) { _tlPage = val; loadTimeline(); }
+    else { e.target.value = _tlPage + 1; }
+  });
   loadTimeline();
+  _openStatusStream();
   // Inject Model Hub pill into header-actions (guard against duplicates)
   _injectTimelinePill();
   // Auto-refresh timeline every 30s
-  if (window._tlRefresh) clearInterval(window._tlRefresh);
+  clearInterval(window._tlRefresh);
   window._tlRefresh = setInterval(() => { if (currentView === 'timeline') loadTimeline(true); }, 30000);
+}
+
+// Called by core.js navigate() when leaving the timeline view
+function onTimelineLeave() {
+  _closeStatusStream();
 }
 
 function shiftDate(days) {
   const d = new Date(currentDate); d.setDate(d.getDate() + days);
   currentDate = d.toISOString().split('T')[0];
   $('#timeline-date').value = currentDate;
+  _tlPage = 0;
   loadTimeline();
 }
 
 async function loadTimeline(silent = false) {
   const list = $('#timeline-list');
+  if (!list) return;  // view destroyed mid-flight
   if (!silent) list.innerHTML = '<div class="spinner"></div>';
   try {
-    const data = await api(`/api/timeline?date=${currentDate}`);
+    const offset = _tlPage * TL_PAGE_SIZE;
+    const data = await api(`/api/timeline?date=${currentDate}&limit=${TL_PAGE_SIZE}&offset=${offset}`);
+    if (!document.getElementById('timeline-list')) return;  // navigated away
     const acts = data.activities || [];
+    const total = data.total || acts.length;
+    const totalPages = Math.max(1, Math.ceil(total / TL_PAGE_SIZE));
+    if (_tlPage >= totalPages) { _tlPage = totalPages - 1; return loadTimeline(silent); }
 
     // Also fetch meetings for this date
     let meetings = [];
@@ -42,9 +85,16 @@ async function loadTimeline(silent = false) {
       const mData = await api(`/api/meetings?date=${currentDate}`);
       meetings = mData.meetings || [];
     } catch { /* meetings endpoint not available */ }
-
-    const totalCount = acts.length + meetings.length;
-    $('#tl-count').textContent = `${totalCount} activities` + (meetings.length ? ` · ${meetings.length} meeting${meetings.length > 1 ? 's' : ''}` : '');
+    const pager = $('#tl-pagination');
+    if (total > TL_PAGE_SIZE) {
+      pager.style.display = '';
+      $('#tl-page-input').value = _tlPage + 1;
+      $('#tl-total-pages').textContent = totalPages;
+      $('#tl-prev-page').disabled = _tlPage === 0;
+      $('#tl-next-page').disabled = _tlPage >= totalPages - 1;
+    } else {
+      pager.style.display = 'none';
+    }
 
     if (!acts.length && !meetings.length) {
       list.innerHTML = `<div class="onboarding">
@@ -67,13 +117,90 @@ async function loadTimeline(silent = false) {
       </div>`;
       return;
     }
-    // Render meeting cards first, then activity cards
-    const meetingHtml = meetings.map(m => meetingCard(m)).join('');
+    // Render meeting cards first (page 1 only), then activity cards
+    const meetingHtml = _tlPage === 0 ? meetings.map(m => meetingCard(m)).join('') : '';
     const activityHtml = acts.map((a, i) => timelineCard(a, i)).join('');
     list.innerHTML = meetingHtml + activityHtml;
   } catch (err) {
     list.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div><div class="empty-title">Error</div><div>${err.message}</div></div>`;
   }
+}
+
+// ── Live status panel (SSE) ───────────────────────────────
+const _TL_STAGE_LABELS = {
+  processing: '⚙️ Processing…',
+  ocr: '🔤 Extracting text…',
+  analyzing: '🤖 Analyzing…',
+  done: '✅ Done',
+  failed: '⚠️ Failed',
+  yielded: '⏸ Yielded to chat',
+  requeued: '↻ Re-queued',
+};
+
+function _openStatusStream() {
+  _closeStatusStream();
+  try {
+    _tlStatusES = new EventSource('/api/analysis/stream');
+    _tlStatusES.onmessage = function(e) {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      if (ev.type === 'status') _renderStatusSnapshot(ev);
+      else if (ev.type === 'delta') _appendStatusDelta(ev.text || '');
+    };
+    _tlStatusES.onerror = function() {
+      // Server gone / restart — EventSource retries automatically;
+      // hide the panel so stale state doesn't linger.
+      const panel = document.getElementById('tl-status-panel');
+      if (panel) panel.style.display = 'none';
+    };
+  } catch { /* EventSource unavailable — panel simply stays hidden */ }
+}
+
+function _closeStatusStream() {
+  if (_tlStatusES) { _tlStatusES.close(); _tlStatusES = null; }
+  if (_tlStatusHideTimer) { clearTimeout(_tlStatusHideTimer); _tlStatusHideTimer = null; }
+}
+
+function _renderStatusSnapshot(s) {
+  const panel = document.getElementById('tl-status-panel');
+  if (!panel) return;
+  if (_tlStatusHideTimer) { clearTimeout(_tlStatusHideTimer); _tlStatusHideTimer = null; }
+
+  panel.style.display = '';
+  $('#tl-status-stage').textContent = _TL_STAGE_LABELS[s.stage] || s.stage;
+  $('#tl-status-daynum').textContent = s.day_number ? `${s.date}_${s.day_number}` : '';
+  $('#tl-status-app').textContent = s.app_name || '';
+  $('#tl-status-queue').textContent = s.queue_size > 0 ? `${s.queue_size} queued` : '';
+  const thumb = $('#tl-status-thumb');
+  const src = s.activity_id ? `/api/screenshot/${s.activity_id}` : '';
+  if (thumb) { thumb.src = src; thumb.style.display = src ? '' : 'none'; }
+
+  const resp = $('#tl-status-response');
+  if (resp) {
+    if (s.stage === 'done' && s.summary) {
+      resp.textContent = s.summary;
+    } else if (s.stage === 'failed' && s.summary) {
+      resp.textContent = s.summary;
+    } else {
+      resp.textContent = s.response || '';
+    }
+    resp.scrollTop = resp.scrollHeight;
+  }
+
+  // Terminal states: keep visible briefly, then collapse
+  if (s.stage === 'done' || s.stage === 'failed' || s.stage === 'requeued') {
+    _tlStatusHideTimer = setTimeout(() => {
+      const p = document.getElementById('tl-status-panel');
+      if (p) p.style.display = 'none';
+    }, 8000);
+  }
+}
+
+function _appendStatusDelta(text) {
+  const resp = document.getElementById('tl-status-response');
+  if (!resp) return;
+  resp.textContent += text;
+  resp.scrollTop = resp.scrollHeight;
 }
 
 function meetingCard(m) {
@@ -121,6 +248,9 @@ function timelineCard(a, i) {
   const devCtx = a.repo_name ? `<div class="dev-ctx">🔀 ${a.repo_name}/${a.branch || 'main'} ${a.insertions ? `<span style="color:#10b981">+${a.insertions}</span>` : ''}${a.deletions ? ` <span style="color:#ef4444">-${a.deletions}</span>` : ''}</div>` : '';
   const thumb = a.screenshot_url ? `<img class="thumb" src="${a.screenshot_url}" loading="lazy" onclick="openModal('${a.screenshot_url}', ${a.id})" alt="">` : '<div class="thumb"></div>';
 
+  // Day-scoped event number: YYYY-MM-DD_N (chronological within the day)
+  const dayNum = a.day_number ? `<span class="day-num" title="Event number for the day">${(a.timestamp || '').substring(0, 10)}_${a.day_number}</span>` : '';
+
   // Analysis method badge — color-coded
   const method = a.analysis_method || '';
   const methodColors = {'full': '#a78bfa', 'cache:identical': '#34d399', 'cache:minor': '#fbbf24', 'skipped': '#6b7280', 'backfill:full': '#22d3ee', 'backfill:cache:identical': '#22d3ee', 'backfill:cache:minor': '#22d3ee', 'reanalyze': '#f97316'};
@@ -133,6 +263,7 @@ function timelineCard(a, i) {
       <div class="info">
         <div class="top">
           <span class="time">${time}</span>
+          ${dayNum}
           <span class="app-name">${a.app_name || 'Unknown'}</span>
           <span class="badge badge-${cat}">${cat}</span>${methodBadge}
         </div>
@@ -221,9 +352,7 @@ window.deleteActivity = async function(id, btn) {
     if (!r.ok) throw new Error('Failed');
     setTimeout(function() { card.remove(); }, 300);
     showToast('Activity deleted', 'success');
-    const count = document.querySelectorAll('.timeline-item').length - 1;
-    const countEl = $('#tl-count');
-    if (countEl) countEl.textContent = `${count} activities`;
+    loadTimeline(true);
   } catch (err) {
     card.style.transform = ''; card.style.opacity = '';
     showToast('Delete failed', 'warning');
@@ -257,6 +386,7 @@ window.executeClearTimeline = async function() {
     const r = await fetch(`/api/timeline/clear?date=${currentDate}`, { method: 'DELETE' });
     const data = await r.json();
     showToast(`Cleared ${data.deleted} activities for ${data.date}`, 'success');
+    _tlPage = 0;
     loadTimeline();
   } catch (err) {
     showToast('Failed to clear timeline', 'warning');

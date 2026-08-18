@@ -837,3 +837,116 @@ class TestVisionModelRouting:
         assert vision_model_window() == 65536
         mock_settings.vision_llm_enabled = False
         assert vision_model_window() is None
+
+
+class _FakeSSEResponse:
+    """Minimal stand-in for the httpx streaming response context manager."""
+
+    def __init__(self, lines, status_code=200):
+        self._lines = lines
+        self.status_code = status_code
+        self.text = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def read(self):
+        pass
+
+
+def _sse_lines(*deltas, done=True):
+    import json as _json
+    lines = [
+        f'data: {_json.dumps({"choices": [{"delta": {"content": d}}]})}'
+        for d in deltas
+    ]
+    if done:
+        lines.append("data: [DONE]")
+    return lines
+
+
+class TestStreamingChat:
+    """chat(stream_callback=...) uses SSE streaming and accumulates the text."""
+
+    def _mock_stream(self, mock_client_cls, lines, status_code=200):
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _FakeSSEResponse(lines, status_code)
+        mock_client_cls.return_value = mock_client
+        return mock_client
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_returns_accumulated_text_and_fires_callback(self, mock_client_cls):
+        self._mock_stream(mock_client_cls, _sse_lines("Hel", "lo", " world"))
+        chunks = []
+        result = chat([{"role": "user", "content": "hi"}], stream_callback=chunks.append)
+        assert result == "Hello world"
+        assert chunks == ["Hel", "lo", " world"]
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_payload_sets_stream_true(self, mock_client_cls):
+        mock_client = self._mock_stream(mock_client_cls, _sse_lines("ok"))
+        chat([{"role": "user", "content": "hi"}], stream_callback=lambda c: None)
+        _, kwargs = mock_client.stream.call_args
+        assert kwargs["json"]["stream"] is True
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_non_stream_omits_stream_key(self, mock_client_cls):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_client_cls.return_value.post.return_value = mock_resp
+        chat([{"role": "user", "content": "hi"}])
+        _, kwargs = mock_client_cls.return_value.post.call_args
+        assert "stream" not in kwargs["json"]
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_skips_malformed_and_empty_deltas(self, mock_client_cls):
+        import json as _json
+        lines = [
+            "data: not-json",
+            f'data: {_json.dumps({"choices": [{"delta": {}}]})}',  # no content
+            f'data: {_json.dumps({"choices": []})}',               # no choice
+            f'data: {_json.dumps({"choices": [{"delta": {"content": "real"}}]})}',
+            "data: [DONE]",
+        ]
+        self._mock_stream(mock_client_cls, lines)
+        chunks = []
+        result = chat([{"role": "user", "content": "hi"}], stream_callback=chunks.append)
+        assert result == "real"
+        assert chunks == ["real"]
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_cancel_during_stream_raises(self, mock_client_cls):
+        """cancel_current_inference() mid-stream aborts like the sync path."""
+        import json as _json
+        lines = [
+            f'data: {_json.dumps({"choices": [{"delta": {"content": "x"}}]})}',
+            f'data: {_json.dumps({"choices": [{"delta": {"content": "y"}}]})}',
+        ]
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _FakeSSEResponse(lines)
+        mock_client_cls.return_value = mock_client
+        _cancel_event.clear()
+
+        def _cb(chunk):
+            _cancel_event.set()
+
+        with pytest.raises(InferenceCancelled):
+            chat([{"role": "user", "content": "hi"}], stream_callback=_cb)
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_http_error_status_raises(self, mock_client_cls):
+        resp = _FakeSSEResponse([], status_code=500)
+        def _raise():
+            raise httpx.HTTPStatusError("500", request=MagicMock(), response=MagicMock())
+        resp.raise_for_status = _raise
+        mock_client = MagicMock()
+        mock_client.stream.return_value = resp
+        mock_client_cls.return_value = mock_client
+        with pytest.raises(httpx.HTTPStatusError):
+            chat([{"role": "user", "content": "hi"}], stream_callback=lambda c: None)

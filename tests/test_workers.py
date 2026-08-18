@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from screenmind.workers.capture_worker import CaptureWorker, CaptureResult
+from screenmind.engine.llm_client import InferenceCancelled
 
 
 class TestCaptureWorker:
@@ -660,3 +661,157 @@ class TestQualityGateSkipsScene:
         assert analyze_fn.call_count == 2
         saved = worker._db.update_activity_analysis.call_args.kwargs["analysis"]
         assert saved.activity_summary == "Editing main.py"
+
+
+class TestLiveStatus:
+    """Live status: current-item snapshot + SSE event bus."""
+
+    def _worker(self):
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        db = MagicMock()
+        db.get_day_number.return_value = 3
+        worker = AnalysisWorker(queue=asyncio.Queue(), database=db)
+        worker._loop = asyncio.get_event_loop()
+        return worker
+
+    def _capture(self):
+        img = MagicMock()
+        img.size = (1920, 1080)
+        return CaptureResult(
+            filepath=Path(__file__),
+            timestamp=datetime(2026, 5, 16, 10, 0, 0),
+            window_title="main.py - VS Code",
+            app_name="Code",
+            bookmarked=False,
+            image=img,
+            activity_id=7,
+            a11y_text=None,
+            phash=None,
+            is_backfill=False,
+        )
+
+    async def test_begin_current_builds_snapshot(self):
+        worker = self._worker()
+        worker._begin_current(7, self._capture())
+        snap = worker.current_status
+        assert snap["activity_id"] == 7
+        assert snap["day_number"] == 3
+        assert snap["date"] == "2026-05-16"
+        assert snap["stage"] == "processing"
+        assert snap["response"] == ""
+
+    async def test_stream_chunk_accumulates_and_publishes_delta(self):
+        worker = self._worker()
+        q = worker.subscribe()
+        worker._begin_current(7, self._capture())
+        worker._stream_chunk("Hel")
+        worker._stream_chunk("lo")
+        await asyncio.sleep(0)  # let call_soon_threadsafe callbacks deliver
+        assert worker.current_status["response"] == "Hello"
+        deltas = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev["type"] == "delta":
+                deltas.append(ev["text"])
+        assert deltas == ["Hel", "lo"]
+        worker.unsubscribe(q)
+
+    async def test_set_stage_resets_response(self):
+        """Each stage streams fresh model output — stale text must not leak."""
+        worker = self._worker()
+        worker._begin_current(7, self._capture())
+        worker._stream_chunk("scene text")
+        worker._set_stage("analyzing")
+        assert worker.current_status["stage"] == "analyzing"
+        assert worker.current_status["response"] == ""
+
+    async def test_finish_current_sets_summary(self):
+        worker = self._worker()
+        worker._begin_current(7, self._capture())
+        worker._finish_current("done", summary="Editing code")
+        snap = worker.current_status
+        assert snap["stage"] == "done"
+        assert snap["summary"] == "Editing code"
+
+    async def test_stats_expose_current(self):
+        worker = self._worker()
+        assert worker.stats["current"] is None
+        worker._begin_current(7, self._capture())
+        assert worker.stats["current"]["activity_id"] == 7
+
+    async def test_slow_consumer_drops_oldest_not_newest(self):
+        """A stalled SSE client keeps receiving the freshest events."""
+        worker = self._worker()
+        q = asyncio.Queue(maxsize=2)
+        worker._subscribers.add(q)
+        for i in range(5):
+            worker._enqueue(q, {"type": "delta", "text": str(i)})
+        events = [q.get_nowait()["text"] for _ in range(q.qsize())]
+        assert events[-1] == "4"  # newest survives
+
+    async def test_process_emits_full_lifecycle(self):
+        """_process drives processing → ocr → analyzing → done, streaming
+        the model response and finishing with the summary."""
+        worker = self._worker()
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("screen text " * 10, [])))
+
+        def _analyze(**kwargs):
+            # The analyzer must receive the stream callback and invoke it
+            cb = kwargs.get("stream_callback")
+            assert cb is not None
+            cb("model ")
+            cb("answer")
+            rec = MagicMock(
+                scene_description=None,
+                activity_summary="Editing main.py",
+                activity_category="coding",
+                visible_text_snippets=[], detailed_context="", app_name="VS Code",
+            )
+            return rec, []
+
+        worker._analyzer.analyze_screenshot_fast = MagicMock(side_effect=_analyze)
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value=None)
+        worker._dev_context.is_coding_activity = MagicMock(return_value=False)
+        worker._embedder = None
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        snap = worker.current_status
+        assert snap["stage"] == "done"
+        assert snap["summary"] == "Editing main.py"
+        assert snap["response"] == "model answer"
+
+    async def test_process_failure_marks_failed(self):
+        worker = self._worker()
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("text " * 20, [])))
+        worker._analyzer.analyze_screenshot_fast = MagicMock(side_effect=RuntimeError("inference exploded"))
+        worker._analyzer.generate_scene_from_text = MagicMock(return_value=None)
+        worker._dev_context.is_coding_activity = MagicMock(return_value=False)
+        worker._embedder = None
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        snap = worker.current_status
+        assert snap["stage"] == "failed"
+        assert "inference exploded" in snap["summary"]
+
+    async def test_process_cancellation_marks_yielded(self):
+        worker = self._worker()
+        worker._ocr = MagicMock(is_available=True,
+                                extract_text_with_boxes=MagicMock(return_value=("text " * 20, [])))
+        worker._analyzer.analyze_screenshot_fast = MagicMock(side_effect=InferenceCancelled("chat"))
+        worker._embedder = None
+
+        with patch("screenmind.workers.analysis_worker.settings",
+                   sensitive_filter_enabled=False, auto_bookmark=False):
+            await worker._process(self._capture())
+
+        assert worker.current_status["stage"] == "yielded"
+        # Item re-queued at front for resumption
+        assert len(worker._priority_items) == 1
