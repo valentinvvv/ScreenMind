@@ -284,6 +284,11 @@ def chat(
 
     use_text_model = _route_to_text_model(messages, max_tokens)
     use_vision_model = not use_text_model and _route_to_vision_model(messages)
+    logger.info(
+        f"LLM route: {'text' if use_text_model else 'vision' if use_vision_model else 'primary'} "
+        f"(text_configured={_text_model_configured()}, routing={settings.text_llm_routing}, "
+        f"vision_configured={_vision_model_configured()}, has_images={_has_images(messages)})"
+    )
 
     def _endpoint(route: str):
         """(url, headers) for a route: 'text', 'vision', or 'primary'."""
@@ -337,8 +342,8 @@ def chat(
             if payload.get("model") is None:
                 payload.pop("model", None)
             logger.warning(
-                f"{'Text' if use_text_model else 'Vision'} model unreachable — "
-                f"falling back to the primary model"
+                f"{'Text' if use_text_model else 'Vision'} model unreachable "
+                f"({type(last_exc).__name__}: {last_exc}) — falling back to the primary model"
             )
         client = httpx.Client(timeout=timeout)
         with _client_lock:
