@@ -230,7 +230,6 @@ class TestBackfillFailureLoop:
         """A cooling-down row is skipped; the next candidate is processed."""
         row1 = (450, __file__, "t1", "app1", None, None, "2026-08-18 07:00:00")
         row2 = (451, __file__, "t2", "app2", None, None, "2026-08-18 07:01:00")
-        row2 = (451, __file__, "t2", "app2", None, None)
         worker = self._worker([row1, row2], "Analysis failed")
         worker._backfill_cooldown[450] = time.time()  # fresh cooldown
         p1, p2 = self._patch_image_load()

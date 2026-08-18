@@ -151,11 +151,6 @@ class TestAnalysisStreamEndpoint:
                         break
             except asyncio.TimeoutError:
                 pytest.fail("Timeout waiting for SSE event")
-                while True:
-                    line = await it.__anext__()
-                    if line.startswith("data:"):
-                        ev = json.loads(line.removeprefix("data:").strip())
-                        break
             await task
             assert ev == {"type": "delta", "text": "hello"}
         finally:
