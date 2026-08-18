@@ -43,10 +43,11 @@ def _setup_logging():
         stderr_handler.setFormatter(fmt)
         root.addHandler(stderr_handler)
 
-    # Optionally log to a rotating file
+    # Log to a rotating file by default. Under pythonw.exe on Windows,
+    # sys.stderr is not None but raises on write — the old `sys.stderr is None`
+    # check never fired, so installed builds had no log file at all.
     log_file = os.environ.get("SCREENMIND_LOG_FILE")
-    # Auto-enable file logging when stderr is unavailable (pythonw.exe)
-    if not log_file and sys.stderr is None:
+    if not log_file:
         _data = os.environ.get("SCREENMIND_DATA_DIR", os.path.join(os.path.expanduser("~"), ".screenmind"))
         os.makedirs(_data, exist_ok=True)
         log_file = os.path.join(_data, "screenmind.log")
