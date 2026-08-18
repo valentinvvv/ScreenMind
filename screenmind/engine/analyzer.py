@@ -42,6 +42,21 @@ VALID_CATEGORIES = {
 VALID_MOODS = {"productive", "distracted", "collaborative", "learning", "neutral"}
 
 
+# Remote-desktop clients (Citrix, RDP, VNC, …): the window title holds the
+# session/hostname and the outer frame is the client's chrome — the actual
+# work is whatever runs INSIDE the remote session.
+_REMOTE_SESSION_RE = re.compile(
+    r"desktop\s*viewer|remote\s*desktop|mstsc|citrix|vnc\s*viewer|\bvnc\b|"
+    r"vmware\s*horizon|freerdp|remmina|parsec|teamviewer|anydesk",
+    re.I,
+)
+
+
+def is_remote_session(app_name: Optional[str], window_title: Optional[str]) -> bool:
+    """True when the capture shows a remote-desktop client window."""
+    return bool(_REMOTE_SESSION_RE.search(f"{app_name or ''} {window_title or ''}"))
+
+
 # ── App Reconciliation Data ──────────────────────────────────────────────────
 # Three-signal reconciliation: OS process name + window title + Gemma vision.
 # See: https://github.com/ayushh0110/ScreenMind/issues/6
@@ -354,6 +369,12 @@ class GemmaAnalyzer:
             words = [w for w in words if len(w) > 2]
             filtered_ocr = ' '.join(sorted(set(words)))
             hints.append(f"Extracted text (accurate):\n{filtered_ocr}")
+        if is_remote_session(app_name_hint, window_title):
+            hints.append(
+                "This is a REMOTE-DESKTOP session: analyze the applications and "
+                "content visible INSIDE the remote session, not the remote "
+                "client's toolbar/title bar/connection frame"
+            )
         if hints:
             prompt += f"\n\nContext: {chr(10).join(hints)}"
 
@@ -427,11 +448,25 @@ class GemmaAnalyzer:
             context.append(f"Window title: {window_title}")
         context_str = f"Context: {chr(10).join(context)}{chr(10)}" if context else ""
 
+        if is_remote_session(app_name, window_title):
+            instruction = (
+                "This is a REMOTE-DESKTOP session (Citrix/RDP/VNC client). "
+                "The extracted text is what is shown INSIDE the remote machine — "
+                "that is the real scene. Describe the applications, windows and "
+                "content visible inside the session. Do NOT describe the remote "
+                "client itself: ignore its toolbar, connection/session title, "
+                "window frame and hostname. Do NOT summarize.\n\n"
+            )
+        else:
+            instruction = (
+                "Below is text extracted from a screenshot (organized by screen region when possible). "
+                "Write a detailed scene description: a plain inventory of everything visible — "
+                "every UI element, message, and text item. Do NOT summarize.\n\n"
+            )
+
         prompt = (
             f"{context_str}"
-            f"Below is text extracted from a screenshot (organized by screen region when possible). "
-            f"Write a detailed scene description: a plain inventory of everything visible — "
-            f"every UI element, message, and text item. Do NOT summarize.\n\n"
+            f"{instruction}"
             f"{body}"
         )
 
@@ -488,6 +523,12 @@ class GemmaAnalyzer:
             words = [w for w in words if len(w) > 2]
             filtered_ocr = ' '.join(sorted(set(words)))
             hints.append(f"Extracted text (accurate):\n{filtered_ocr}")
+        if is_remote_session(app_name_hint, window_title):
+            hints.append(
+                "This is a REMOTE-DESKTOP session: analyze the applications and "
+                "content visible INSIDE the remote session, not the remote "
+                "client's toolbar/title bar/connection frame"
+            )
         context_str = f"\n\nContext: {chr(10).join(hints)}" if hints else ""
 
         prompt = SPLIT_ANALYSIS_PROMPT + context_str
@@ -563,6 +604,12 @@ class GemmaAnalyzer:
             words = [w for w in words if len(w) > 2]
             filtered_ocr = ' '.join(sorted(set(words)))
             hints.append(f"Extracted text (accurate):\n{filtered_ocr}")
+        if is_remote_session(app_name_hint, window_title):
+            hints.append(
+                "This is a REMOTE-DESKTOP session: analyze the applications and "
+                "content visible INSIDE the remote session, not the remote "
+                "client's toolbar/title bar/connection frame"
+            )
         context_str = f"\n\nContext: {chr(10).join(hints)}" if hints else ""
 
         image_bytes = self._image_to_bytes(image)

@@ -488,6 +488,12 @@ def _fallback_subject(title: str) -> str:
     return ""
 
 
+def _is_remote(app_name: str, title: str) -> bool:
+    """Remote-desktop session? Shared detector lives in analyzer.py."""
+    from screenmind.engine.analyzer import is_remote_session
+    return is_remote_session(app_name, title)
+
+
 def _aggregate_timesheet(analyzed: list, interval: int):
     """Split the day's captures into helpdesk-ticket work (window title
     'Ticket NNNNN') and other work grouped by normalized window title.
@@ -524,12 +530,11 @@ def _aggregate_timesheet(analyzed: list, interval: int):
             if not title.strip() or _NOISE_TITLE_RE.search(title):
                 continue
             key = _normalize_title(title)[:80]
-            app_low = (a.get("app_name") or "").lower()
             entry = other.setdefault(
                 key,
                 {"times": [], "title": key, "app": a.get("app_name") or "?",
                  "customer": "", "texts": [], "_seen": set(),
-                 "remote": "desktop viewer" in key.lower() or "citrix" in app_low},
+                 "remote": _is_remote(a.get("app_name"), title)},
             )
             entry["times"].append(ts)
             if not entry["customer"]:

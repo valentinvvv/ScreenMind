@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from screenmind.engine.analyzer import GemmaAnalyzer
+from screenmind.engine.analyzer import GemmaAnalyzer, is_remote_session
 
 
 def test_parse_clean_json():
@@ -139,3 +139,63 @@ class TestSceneFromText:
         budget = (2048 - 700) * 2  # window minus prompt+output, at 2 chars/token
         assert "z" * budget in prompt
         assert "z" * (budget + 1) not in prompt
+
+
+class TestRemoteSessionDetection:
+    """is_remote_session — remote-desktop clients must be recognized from
+    the OS app name or window title so scene narration targets the session
+    content, not the client chrome."""
+
+    def test_citrix_desktop_viewer_title(self):
+        assert is_remote_session(
+            "Citrix.DesktopViewer.App", "GITSMGMT-XA FSlogix - Desktop Viewer")
+
+    def test_citrix_app_name_alone(self):
+        assert is_remote_session("Citrix.DesktopViewer.App", "")
+        assert is_remote_session("Citrix Workspace", "Some session")
+
+    def test_mstsc_and_vnc(self):
+        assert is_remote_session("mstsc.exe", "SRV01 - Remote Desktop Connection")
+        assert is_remote_session("vncviewer", "host - VNC Viewer")
+
+    def test_regular_windows_not_remote(self):
+        assert not is_remote_session("chrome.exe", "Inbox - Outlook")
+        assert not is_remote_session(None, None)
+        assert not is_remote_session("code.exe", "main.py - Visual Studio Code")
+
+
+class TestSceneFromTextRemoteSession:
+    """Remote-desktop captures: the scene prompt must point the model at
+    the content INSIDE the session, not the client's toolbar/title."""
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_remote_prompt_targets_session_content(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.return_value = "scene"
+        GemmaAnalyzer().generate_scene_from_text(
+            ocr_text="Backup job GITSLAB_VCA7 credentials management " * 5,
+            app_name="Citrix.DesktopViewer.App",
+            window_title="GITSMGMT-XA FSlogix - Desktop Viewer",
+        )
+        prompt = mock_llm.chat.call_args.kwargs["messages"][0]["content"]
+        assert "REMOTE-DESKTOP session" in prompt
+        assert "INSIDE the remote machine" in prompt
+        # The generic inventory instruction must not be used for remotes
+        assert "plain inventory of everything visible" not in prompt
+
+    @patch("screenmind.engine.analyzer.llm_client")
+    @patch("screenmind.engine.analyzer.settings")
+    def test_regular_prompt_unchanged(self, mock_settings, mock_llm):
+        mock_settings.context_window = 8192
+        mock_llm.text_model_window.return_value = None
+        mock_llm.chat.return_value = "scene"
+        GemmaAnalyzer().generate_scene_from_text(
+            ocr_text="editing auth_middleware.py in VS Code " * 5,
+            app_name="code.exe",
+            window_title="auth_middleware.py - Visual Studio Code",
+        )
+        prompt = mock_llm.chat.call_args.kwargs["messages"][0]["content"]
+        assert "plain inventory of everything visible" in prompt
+        assert "REMOTE-DESKTOP" not in prompt
