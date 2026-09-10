@@ -339,6 +339,8 @@ class TestManualBackfillBatch:
 
     async def test_prepare_runs_ahead_of_analyze(self):
         """The next row is prepared while the current one is in the model."""
+        from screenmind.config import settings
+
         rows = [(1, "a.jpg", "t", "app", None), (2, "b.jpg", "t", "app", None)]
         worker = self._worker(rows)
         worker._backfill_status = {"running": True, "requested": 2,
@@ -361,14 +363,24 @@ class TestManualBackfillBatch:
 
         worker._prepare_backfill_row = AsyncMock(side_effect=_prepare)
         worker._analyze_prepared_row = AsyncMock(side_effect=_analyze)
-        task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
-        for _ in range(10):
-            await asyncio.sleep(0)
 
-        # Row 2's CPU stage finished without waiting for row 1's model call
+        # Pin the depth: at 1, row 2 may only be prepared once an analyzer has
+        # taken row 1 — which is the interesting case, and the one that shows
+        # the CPU stage overlapping the model call rather than following it.
+        with patch.object(settings, "backfill_concurrency", 1):
+            task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
+            try:
+                for _ in range(40):          # _prep_loop polls, so allow real time
+                    await asyncio.sleep(0.05)
+                    if prepared == [1, 2]:
+                        break
+            finally:
+                # Always unblock, so a failed assertion reports instead of hanging
+                release.set()
+                await asyncio.wait_for(task, timeout=5)
+
+        # Row 2's CPU stage finished while row 1 was still in the model
         assert prepared == [1, 2]
-        release.set()
-        await asyncio.wait_for(task, timeout=5)
         assert worker.backfill_status["analyzed"] == 2
 
     async def test_concurrency_keeps_several_rows_in_the_model(self):
