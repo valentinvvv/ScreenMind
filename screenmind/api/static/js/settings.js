@@ -13,7 +13,10 @@ async function renderSettings(el) {
 
   function _sec(icon, title) { return '<div class="settings-section"><span class="settings-section-icon">' + icon + '</span><span class="settings-section-title">' + title + '</span></div>'; }
   function _sw(id, checked) { return '<label class="toggle-switch"><input type="checkbox" id="' + id + '" ' + (checked ? 'checked' : '') + '><span class="toggle-slider"></span></label>'; }
-  function _rp(name, val, label, cur) { return '<label class="radio-pill ' + (cur === val ? 'active' : '') + '"><input type="radio" name="' + name + '" value="' + val + '" ' + (cur === val ? 'checked' : '') + '> ' + label + '</label>'; }
+  // `val` is always a string (it becomes an HTML attribute) while `cur` comes
+  // straight from JSON — retention_days arrives as a number, so a strict
+  // compare marked no pill active and left the group with nothing checked.
+  function _rp(name, val, label, cur) { var on = String(cur) === String(val); return '<label class="radio-pill ' + (on ? 'active' : '') + '"><input type="radio" name="' + name + '" value="' + val + '" ' + (on ? 'checked' : '') + '> ' + label + '</label>'; }
 
   var wh_events = (cfg.webhook_events || 'summary,standup').split(',');
 
@@ -336,6 +339,16 @@ async function renderSettings(el) {
       if (fields) fields.style.display = visionToggle.checked ? 'block' : 'none';
     });
   }
+  // The radio inputs are display:none — `.active` on the label is the only
+  // thing the user sees, and it was only ever set during render.
+  el.querySelectorAll('.radio-group').forEach(function(group) {
+    group.addEventListener('change', function(ev) {
+      if (!ev.target.matches('input[type="radio"]')) return;
+      group.querySelectorAll('.radio-pill').forEach(function(pill) {
+        pill.classList.toggle('active', pill.contains(ev.target));
+      });
+    });
+  });
   el.querySelectorAll('#retention-group input').forEach(function(radio) {
     radio.addEventListener('change', updateStorageEstimate);
   });
@@ -614,7 +627,9 @@ window.saveSettings = async function() {
     capture_active_monitor: document.getElementById('capture-active-monitor').checked,
     meeting_transcription: document.getElementById('meeting-toggle').checked,
     meeting_apps: document.getElementById('meeting-apps-input').value,
-    retention_days: retention ? parseInt(retention.value) : 7,
+    // No fallback on purpose: guessing here once silently rewrote "Forever"
+    // to 7 days, and the startup cleanup deletes anything older than that.
+    // The key is dropped below when the group has no selection.
     // LLM Backend
     gemma_mode: (document.querySelector('input[name="gemma_mode"]:checked') || {}).value || 'local',
     llm_api_base_url: (document.getElementById('llm-base-url') || {}).value || '',
@@ -663,6 +678,7 @@ window.saveSettings = async function() {
     pause_hotkey: document.getElementById('pause-hotkey-input').value,
     voice_hotkey: document.getElementById('voice-hotkey-input').value,
   };
+  if (retention) body.retention_days = parseInt(retention.value);
   try {
     await fetch('/api/settings', {
       method: 'POST',
