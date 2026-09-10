@@ -33,7 +33,7 @@ from screenmind.engine.dev_context import DevContextDetector
 from screenmind.engine.embedder import Embedder
 from screenmind.engine.llm_client import InferenceCancelled
 from screenmind.engine.ocr import OCRExtractor
-from screenmind.storage.database import Database
+from screenmind.storage.database import Database, UNPROCESSED_WHERE
 from screenmind.storage.models import ScreenshotEntry, ActivityRecord
 from screenmind.workers.capture_worker import CaptureResult
 
@@ -108,9 +108,14 @@ class AnalysisWorker:
         self._processed = 0
         self._errors = 0
         # Progress of the manual batch (POST /api/timeline/backfill).
-        # running=True also tells the idle loop to stand down.
+        # running=True also tells the idle loop to stand down. state is the
+        # user-facing phase the dashboard renders: idle / running / waiting
+        # (live captures have priority) / finished / cancelled.
         self._backfill_status = {"running": False, "requested": 0,
-                                 "analyzed": 0, "failed": 0, "skipped": 0}
+                                 "analyzed": 0, "failed": 0, "skipped": 0,
+                                 "state": "idle"}
+        # Set by stop_backfill_batch() — the batch loop checks it between rows.
+        self._backfill_cancel = False
         # Progress of the scene-description batch (POST /api/timeline/scenes/backfill).
         # Fills in scene_description for analyzed rows that never got one.
         self._scene_backfill_status = {"running": False, "requested": 0,
@@ -229,6 +234,10 @@ class AnalysisWorker:
         self._current["queue_size"] = self._queue.qsize()
         self._publish({"type": "status", **self._current})
 
+    def _publish_backfill(self):
+        """Broadcast manual-batch progress to the SSE stream."""
+        self._publish({"type": "backfill", **self._backfill_status})
+
     @property
     def current_status(self) -> Optional[dict]:
         """Snapshot of the item being processed (or last finished one)."""
@@ -249,7 +258,8 @@ class AnalysisWorker:
         try:
             conn = self._db._get_conn()
             pending = conn.execute(
-                "SELECT COUNT(*) FROM activities WHERE (analyzed = 0 OR summary = 'Skipped (analysis backlog)' OR summary LIKE 'Analysis failed%') AND timestamp >= datetime('now', 'localtime', '-24 hours')"
+                f"SELECT COUNT(*) FROM activities WHERE {UNPROCESSED_WHERE} "
+                "AND timestamp >= datetime('now', 'localtime', '-24 hours')"
             ).fetchone()[0]
             if pending:
                 logger.info(f"Found {pending} unanalyzed entries — will backfill during idle")
@@ -817,55 +827,87 @@ class AnalysisWorker:
 
         conn = self._db._get_conn()
         rows = conn.execute(
-            """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes, timestamp
-               FROM activities
-               WHERE (analyzed = 0
-                  OR summary = 'Skipped (analysis backlog)'
-                  OR summary LIKE 'Analysis failed%')
-               ORDER BY timestamp ASC LIMIT ?""",
+            f"""SELECT id, screenshot_path, window_title, app_name, timestamp
+                FROM activities
+                WHERE {UNPROCESSED_WHERE}
+                ORDER BY timestamp ASC LIMIT ?""",
             (limit,),
         ).fetchall()
 
         if not rows:
-            return {"requested": 0, "analyzed": 0, "failed": 0, "skipped": 0}
+            return {"requested": 0, "analyzed": 0, "failed": 0, "skipped": 0,
+                    "state": "idle"}
 
+        self._backfill_cancel = False
         self._backfill_status = {"running": True, "requested": len(rows),
-                                 "analyzed": 0, "failed": 0, "skipped": 0}
+                                 "analyzed": 0, "failed": 0, "skipped": 0,
+                                 "state": "running"}
         asyncio.create_task(self._run_backfill_batch(rows, conn))
+        self._publish_backfill()
         logger.info(f"Manual backfill started: {len(rows)} rows (oldest first)")
         return dict(self._backfill_status)
 
+    def stop_backfill_batch(self) -> dict:
+        """Ask a running batch to stop after the row it is on."""
+        if not self._backfill_status["running"]:
+            return {"stopped": False, **self._backfill_status}
+        self._backfill_cancel = True
+        logger.info("Manual backfill: stop requested")
+        return {"stopped": True, **self._backfill_status}
+
     async def _run_backfill_batch(self, rows, conn):
-        """Process the batch one row at a time; fresh captures pre-empt."""
+        """Process the batch one row at a time; fresh captures pre-empt.
+
+        Live captures keep priority, but the batch waits for the queue to
+        drain and then resumes — the user asked for the whole backlog, and
+        dropping it on the first new screenshot would never finish it.
+        """
         try:
             for row in rows:
-                if self._queue.qsize() > 0:
-                    break  # Fresh captures always take priority
+                if not await self._await_backfill_slot():
+                    break  # Cancelled while running or waiting
                 result = await self._backfill_row(row, conn)
                 key = {"done": "analyzed", "failed": "failed", "skipped": "skipped"}[result]
                 self._backfill_status[key] += 1
+                self._publish_backfill()
         except Exception as e:
             logger.error(f"Manual backfill aborted: {e}")
         finally:
             self._backfill_status["running"] = False
+            self._backfill_status["state"] = "cancelled" if self._backfill_cancel else "finished"
+            self._backfill_cancel = False
+            self._publish_backfill()
             logger.info(
-                f"Manual backfill finished: {self._backfill_status['analyzed']} analyzed, "
+                f"Manual backfill {self._backfill_status['state']}: "
+                f"{self._backfill_status['analyzed']} analyzed, "
                 f"{self._backfill_status['failed']} failed, {self._backfill_status['skipped']} skipped "
                 f"({self._backfill_status['requested']} requested)"
             )
+
+    async def _await_backfill_slot(self) -> bool:
+        """Block until no live capture is queued. False if the batch was stopped."""
+        while not self._backfill_cancel and self._queue.qsize() > 0:
+            if self._backfill_status.get("state") != "waiting":
+                self._backfill_status["state"] = "waiting"
+                self._publish_backfill()
+            await asyncio.sleep(2.0)
+        if self._backfill_cancel:
+            return False
+        if self._backfill_status.get("state") != "running":
+            self._backfill_status["state"] = "running"
+            self._publish_backfill()
+        return True
 
     async def _backfill_one(self):
         """Pick one pending row (newest-first, 24h window, cooldown-aware)."""
         try:
             conn = self._db._get_conn()
             rows = conn.execute(
-                """SELECT id, screenshot_path, window_title, app_name, ocr_text, ocr_boxes, timestamp
-                   FROM activities
-                   WHERE (analyzed = 0
-                      OR summary = 'Skipped (analysis backlog)'
-                      OR summary LIKE 'Analysis failed%')
-                     AND timestamp >= datetime('now', 'localtime', '-24 hours')
-                   ORDER BY timestamp DESC LIMIT 20""",
+                f"""SELECT id, screenshot_path, window_title, app_name, timestamp
+                    FROM activities
+                    WHERE {UNPROCESSED_WHERE}
+                      AND timestamp >= datetime('now', 'localtime', '-24 hours')
+                    ORDER BY timestamp DESC LIMIT 20""",
             ).fetchall()
 
             # Skip rows whose last backfill attempt failed recently (10 min
@@ -892,7 +934,7 @@ class AnalysisWorker:
 
     async def _backfill_row(self, row, conn) -> str:
         """Backfill a single row. Returns 'done', 'failed', or 'skipped'."""
-        activity_id, ss_path, window_title, app_name, _ocr_text, _ocr_boxes_raw, original_timestamp = row
+        activity_id, ss_path, window_title, app_name, original_timestamp = row
         try:
             # Check screenshot still exists on disk
             if not ss_path or not Path(ss_path).exists():

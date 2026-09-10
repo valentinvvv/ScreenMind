@@ -19,6 +19,20 @@ async function renderTimeline(el) {
         <div class="tl-status-response" id="tl-status-response"></div>
       </div>
     </div>
+    <div id="tl-backlog" class="tl-backlog" style="display:none">
+      <div class="tl-backlog-row">
+        <span class="tl-backlog-icon">⚡</span>
+        <div class="tl-backlog-text">
+          <div class="tl-backlog-title" id="tl-backlog-title"></div>
+          <div class="tl-backlog-sub" id="tl-backlog-sub"></div>
+        </div>
+        <button class="btn btn-primary btn-sm" id="tl-backlog-run">Process backlog</button>
+        <button class="btn btn-ghost btn-sm" id="tl-backlog-stop" style="display:none">Stop</button>
+      </div>
+      <div class="tl-backlog-bar" id="tl-backlog-bar" style="display:none">
+        <div class="tl-backlog-fill" id="tl-backlog-fill"></div>
+      </div>
+    </div>
     <div class="date-nav" style="margin-bottom:20px">
       <button class="btn btn-ghost btn-sm" id="prev-day">\u25c0</button>
       <input type="date" id="timeline-date" value="${currentDate}">
@@ -44,18 +58,26 @@ async function renderTimeline(el) {
     if (val >= 0 && val < totalPages) { _tlPage = val; loadTimeline(); }
     else { e.target.value = _tlPage + 1; }
   });
+  $('#tl-backlog-run').addEventListener('click', startBacklog);
+  $('#tl-backlog-stop').addEventListener('click', stopBacklog);
   loadTimeline();
+  loadBacklog();
   _openStatusStream();
   // Inject Model Hub pill into header-actions (guard against duplicates)
   _injectTimelinePill();
   // Auto-refresh timeline every 30s
   clearInterval(window._tlRefresh);
-  window._tlRefresh = setInterval(() => { if (currentView === 'timeline') loadTimeline(true); }, 30000);
+  window._tlRefresh = setInterval(() => {
+    if (currentView !== 'timeline') return;
+    loadTimeline(true);
+    if (!_tlBacklogRunning) loadBacklog();
+  }, 30000);
 }
 
 // Called by core.js navigate() when leaving the timeline view
 function onTimelineLeave() {
   _closeStatusStream();
+  clearTimeout(_tlBacklogSettleTimer);
 }
 
 function shiftDate(days) {
@@ -146,6 +168,7 @@ function _openStatusStream() {
       try { ev = JSON.parse(e.data); } catch { return; }
       if (ev.type === 'status') _renderStatusSnapshot(ev);
       else if (ev.type === 'delta') _appendStatusDelta(ev.text || '');
+      else if (ev.type === 'backfill') _renderBacklog(ev);
     };
     _tlStatusES.onerror = function() {
       // Server gone / restart — EventSource retries automatically;
@@ -201,6 +224,117 @@ function _appendStatusDelta(text) {
   if (!resp) return;
   resp.textContent += text;
   resp.scrollTop = resp.scrollHeight;
+}
+
+// ── Unprocessed backlog (manual batch) ───────────────
+// Screenshots the pipeline still owes analysis: never analyzed, dropped
+// during a backlog, or failed. The panel is hidden when there are none.
+let _tlBacklogCount = 0;
+let _tlBacklogRunning = false;
+let _tlBacklogSettleTimer = null;
+
+async function loadBacklog() {
+  if (!document.getElementById('tl-backlog')) return;
+  try {
+    const d = await api('/api/timeline/unprocessed');
+    if (!document.getElementById('tl-backlog')) return;  // navigated away
+    _tlBacklogCount = d.count || 0;
+    if (d.batch && d.batch.running) _renderBacklog(d.batch);
+    else _renderBacklogIdle(d);
+  } catch { /* endpoint unavailable — leave the panel as it is */ }
+}
+
+function _renderBacklogIdle(d) {
+  const panel = document.getElementById('tl-backlog');
+  if (!panel) return;
+  _tlBacklogRunning = false;
+  if (!d.count) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  $('#tl-backlog-title').textContent = d.count === 1
+    ? '1 screenshot waiting for analysis'
+    : `${d.count} screenshots waiting for analysis`;
+  const parts = [];
+  if (d.unanalyzed) parts.push(`${d.unanalyzed} never analyzed`);
+  if (d.skipped) parts.push(`${d.skipped} skipped`);
+  if (d.failed) parts.push(`${d.failed} failed`);
+  if (d.oldest) parts.push(`oldest ${String(d.oldest).substring(0, 16).replace('T', ' ')}`);
+  $('#tl-backlog-sub').textContent = parts.join(' · ');
+  const run = $('#tl-backlog-run');
+  run.style.display = ''; run.disabled = false;
+  run.textContent = `Process ${d.count}`;
+  $('#tl-backlog-stop').style.display = 'none';
+  $('#tl-backlog-bar').style.display = 'none';
+}
+
+// Renders a batch snapshot — from POST /api/timeline/backfill, from the
+// SSE `backfill` event, or from the /unprocessed poll on view entry.
+function _renderBacklog(b) {
+  const panel = document.getElementById('tl-backlog');
+  if (!panel) return;
+  panel.style.display = '';
+  _tlBacklogRunning = !!b.running;
+
+  const total = b.requested || 0;
+  const done = (b.analyzed || 0) + (b.failed || 0) + (b.skipped || 0);
+  $('#tl-backlog-bar').style.display = '';
+  $('#tl-backlog-fill').style.width = total ? `${Math.round(done / total * 100)}%` : '0%';
+  const run = $('#tl-backlog-run');
+  run.style.display = b.running ? 'none' : '';
+  run.disabled = false;  // re-armed as soon as the batch lets go
+  $('#tl-backlog-stop').style.display = b.running ? '' : 'none';
+
+  let label;
+  if (b.running) {
+    label = b.state === 'waiting'
+      ? '⏸ Paused — live capture goes first'
+      : '⚙️ Processing backlog';
+  } else {
+    label = b.state === 'cancelled' ? '⏹ Stopped' : '✅ Backlog processed';
+  }
+  $('#tl-backlog-title').textContent = `${label} — ${done} / ${total}`;
+  const parts = [`${b.analyzed || 0} analyzed`];
+  if (b.failed) parts.push(`${b.failed} failed`);
+  if (b.skipped) parts.push(`${b.skipped} skipped`);
+  $('#tl-backlog-sub').textContent = parts.join(' · ');
+
+  if (!b.running) {
+    // Batch settled — pull the remaining count and the new cards
+    clearTimeout(_tlBacklogSettleTimer);
+    _tlBacklogSettleTimer = setTimeout(() => {
+      if (currentView !== 'timeline') return;
+      loadBacklog();
+      loadTimeline(true);
+    }, 5000);
+  }
+}
+
+async function startBacklog() {
+  const run = $('#tl-backlog-run');
+  run.disabled = true;
+  try {
+    const limit = Math.min(_tlBacklogCount || 100, 5000);
+    const r = await apiPost(`/api/timeline/backfill?limit=${limit}`);
+    if (r.error) { showToast(r.error, 'warning'); run.disabled = false; return; }
+    if (!r.requested) { showToast('Nothing left to process', 'info'); return loadBacklog(); }
+    if (!r.already_running) showToast(`Processing ${r.requested} screenshots…`, 'success');
+    _renderBacklog({ running: true, ...r });
+  } catch (err) {
+    showToast(`Could not start: ${err.message}`, 'warning');
+    run.disabled = false;
+  }
+}
+
+async function stopBacklog() {
+  const stop = $('#tl-backlog-stop');
+  stop.disabled = true;
+  try {
+    await apiPost('/api/timeline/backfill/stop');
+    showToast('Stopping after the current screenshot…', 'info');
+  } catch (err) {
+    showToast(`Could not stop: ${err.message}`, 'warning');
+  } finally {
+    stop.disabled = false;
+  }
 }
 
 function meetingCard(m) {
