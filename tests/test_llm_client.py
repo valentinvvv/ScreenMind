@@ -166,6 +166,78 @@ class TestInferenceCancellation:
         _cancel_event.clear()
 
 
+class TestNonStreamingEndpointMemory:
+    """Some OpenAI-compatible boundaries reject stream=true outright."""
+
+    def setup_method(self):
+        from screenmind.engine.llm_client import _no_stream_endpoints
+        _no_stream_endpoints.clear()
+
+    teardown_method = setup_method
+
+    def _secondary_settings(self):
+        """Route text-only requests to a secondary endpoint."""
+        from screenmind.config import settings
+        return [
+            patch.object(settings, "text_llm_model_name", "qwen3.5-9b"),
+            patch.object(settings, "text_llm_api_base_url", "http://secondary/v1"),
+            patch.object(settings, "text_llm_routing", "always"),
+        ]
+
+    def _ok_response(self):
+        resp = MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def _run(self, stream_error, calls=1):
+        """chat() with a callback, where the streaming attempt raises."""
+        from screenmind.engine.llm_client import chat
+        client = MagicMock()
+        client.stream.side_effect = stream_error
+        client.post.side_effect = lambda *a, **k: self._ok_response()
+        ctxs = self._secondary_settings()
+        for c in ctxs:
+            c.start()
+        try:
+            with patch("screenmind.engine.llm_client.httpx.Client", return_value=client):
+                for _ in range(calls):
+                    chat([{"role": "user", "content": "hi"}], stream_callback=lambda _t: None)
+        finally:
+            for c in ctxs:
+                c.stop()
+        return client
+
+    @staticmethod
+    def _status_error(code):
+        req = httpx.Request("POST", "http://secondary/v1/chat/completions")
+        resp = httpx.Response(code, json={"error": {"message": "stream unsupported"}}, request=req)
+        return httpx.HTTPStatusError(f"{code}", request=req, response=resp)
+
+    def test_status_rejection_is_remembered(self):
+        from screenmind.engine.llm_client import _no_stream_endpoints
+        self._run(self._status_error(400))
+        assert "http://secondary/v1/chat/completions" in _no_stream_endpoints
+
+    def test_remembered_endpoint_is_not_asked_to_stream_again(self):
+        """The whole point: the second call must not repeat the doomed attempt."""
+        client = self._run(self._status_error(400), calls=2)
+        # One streaming attempt on the first call, none on the second.
+        assert client.stream.call_count == 1
+        streamed = [c for c in client.post.call_args_list if c.kwargs["json"].get("stream")]
+        assert streamed == []
+
+    def test_transport_failure_is_not_remembered(self):
+        """A ConnectTimeout says nothing about streaming support."""
+        from screenmind.engine.llm_client import _no_stream_endpoints
+        self._run(httpx.ConnectTimeout("unreachable"))
+        assert not _no_stream_endpoints
+
+    def test_transport_failure_still_retries_every_call(self):
+        client = self._run(httpx.ConnectTimeout("unreachable"), calls=2)
+        assert client.stream.call_count == 2
+
+
 class TestChat:
     """Tests for the chat() function."""
 

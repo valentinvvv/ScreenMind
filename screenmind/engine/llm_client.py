@@ -98,6 +98,28 @@ _cancel_event = threading.Event()
 _active_clients: set = set()
 _client_lock = threading.Lock()
 
+# Endpoints that answered a streaming request with a 4xx. Some OpenAI-compatible
+# boundaries are deliberately non-streaming, so the first attempt of every single
+# call was a guaranteed rejection — and the analysis stage never streamed into the
+# dashboard, because the streaming attempt always died. Remembering them skips
+# straight to the non-streaming request.
+#
+# Only a status rejection lands here: a ConnectTimeout means the endpoint was
+# unreachable, which says nothing about whether it can stream, and recording it
+# would silently disable streaming for a healthy endpoint. Process-lifetime, since
+# a boundary gaining streaming support is a redeploy — a restart re-probes.
+_no_stream_endpoints: set = set()
+_STREAM_REJECT_CODES = (400, 404, 422, 501)
+
+
+def _rejected_streaming(exc: Optional[Exception]) -> bool:
+    """True when `exc` is an endpoint refusing stream=true, not a transport failure."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response is not None
+        and exc.response.status_code in _STREAM_REJECT_CODES
+    )
+
 
 def cancel_current_inference():
     """
@@ -318,7 +340,9 @@ def chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if stream_callback is not None:
+    # A known non-streaming endpoint is not asked again — see _no_stream_endpoints.
+    want_stream = stream_callback is not None and url not in _no_stream_endpoints
+    if want_stream:
         payload["stream"] = True
     if use_text_model or use_vision_model or _is_custom_backend():
         # OpenAI-compatible APIs require the model identifier in the payload
@@ -340,7 +364,7 @@ def chat(
     # with 400 — retry them without streaming before giving up on the model.
     if use_text_model or use_vision_model:
         attempts = ["secondary", "primary"]
-        if stream_callback is not None:
+        if want_stream:
             attempts.insert(1, "secondary-nostream")
     else:
         attempts = ["primary"]
@@ -348,10 +372,22 @@ def chat(
     for attempt in attempts:
         if attempt == "secondary-nostream":
             payload.pop("stream", None)
-            logger.info(
-                f"{'Text' if use_text_model else 'Vision'} endpoint rejected streaming "
-                f"({type(last_exc).__name__}) — retrying without streaming"
-            )
+            label = "Text" if use_text_model else "Vision"
+            if _rejected_streaming(last_exc):
+                _no_stream_endpoints.add(url)
+                logger.info(
+                    f"{label} endpoint rejected streaming "
+                    f"(HTTP {last_exc.response.status_code}) — retrying without "
+                    f"streaming, and not asking it to stream again"
+                )
+            else:
+                # Not a streaming problem at all — the endpoint failed to answer.
+                # Retry unstreamed anyway (it costs one request and sometimes
+                # works), but never remember it as non-streaming.
+                logger.info(
+                    f"{label} endpoint call failed ({type(last_exc).__name__}) "
+                    f"— retrying without streaming"
+                )
         elif attempt == "primary" and attempts[0] == "secondary":
             # Secondary endpoint failed — retry on the primary backend
             url, headers = _endpoint("primary")
@@ -370,6 +406,8 @@ def chat(
         try:
             if stream_callback is not None and payload.get("stream"):
                 return _stream_chat(client, url, payload, headers, stream_callback)
+            # Falls through to the non-streaming request below; when a callback
+            # was supplied the full text is delivered as one chunk.
             response = client.post(url, json=payload, headers=headers)
             _raise_with_detail(response)
             data = response.json()

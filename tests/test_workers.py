@@ -405,6 +405,46 @@ class TestManualBackfillBatch:
         # Per-item status is suppressed only for the duration of the batch
         assert worker._parallel_backfill is False
 
+    async def test_concurrency_change_applies_to_the_running_batch(self):
+        """The setting is what you reach for when a batch is already crawling."""
+        from screenmind.config import settings
+
+        rows = [(i, f"{i}.jpg", "t", "app", None) for i in range(1, 9)]
+        worker = self._worker(rows)
+        worker._backfill_status = {"running": True, "requested": len(rows),
+                                   "analyzed": 0, "failed": 0, "skipped": 0,
+                                   "state": "running"}
+        self._stub_stages(worker)
+        release = asyncio.Event()
+        peak = 0
+
+        async def _analyze(capture, conn):
+            nonlocal peak
+            peak = max(peak, worker._analyses_in_flight)
+            await release.wait()
+            return "done"
+
+        worker._analyze_prepared_row = AsyncMock(side_effect=_analyze)
+
+        task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
+        try:
+            with patch.object(settings, "backfill_concurrency", 1):
+                await asyncio.sleep(0.4)
+                narrow = peak
+            # User raises it mid-batch — no stop/restart
+            with patch.object(settings, "backfill_concurrency", 3):
+                await asyncio.sleep(0.6)
+                wide = peak
+        finally:
+            # Always unblock, so a failed assertion below reports instead of hanging
+            release.set()
+            await asyncio.wait_for(task, timeout=5)
+
+        assert narrow == 1, f"expected 1 row in the model, saw {narrow}"
+        assert wide == 3, f"expected the batch to widen to 3, saw {wide}"
+        assert worker.backfill_status["analyzed"] == len(rows)
+        assert worker._analyses_in_flight == 0
+
     async def test_batch_waits_for_fresh_capture_then_resumes(self):
         """A queued live capture parks the batch; it resumes once drained."""
         rows = [(1, "a.jpg", "t", "app", None)]
