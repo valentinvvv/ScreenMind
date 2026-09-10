@@ -55,3 +55,35 @@ def test_data_path_resolution():
     s = Settings(data_dir="~/.screenmind")
     assert s.data_path.is_absolute()
     assert "~" not in str(s.data_path)
+
+
+class TestRuntimeOverrideMerge:
+    """save_runtime_overrides must never touch keys it wasn't given.
+
+    The dashboard omits retention_days when its radio group has no selection.
+    Rewriting it there once turned "Forever" into 7 days, and the startup
+    cleanup then permanently deleted everything older than that.
+    """
+
+    def _settings_with_json(self, tmp_path, initial):
+        import json
+        from screenmind.config import Settings
+        s = Settings()
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps(initial))
+        type(s).settings_json_path = property(lambda self, _p=path: _p)
+        return s, path
+
+    def test_omitted_key_is_preserved(self, tmp_path):
+        import json
+        s, path = self._settings_with_json(tmp_path, {"retention_days": 0})
+        s.save_runtime_overrides({"capture_interval": 45})
+        saved = json.loads(path.read_text())
+        assert saved["retention_days"] == 0
+        assert saved["capture_interval"] == 45
+
+    def test_present_key_is_written(self, tmp_path):
+        import json
+        s, path = self._settings_with_json(tmp_path, {"retention_days": 0})
+        s.save_runtime_overrides({"retention_days": 30})
+        assert json.loads(path.read_text())["retention_days"] == 30
