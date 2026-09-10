@@ -39,6 +39,11 @@ from screenmind.workers.capture_worker import CaptureResult
 
 logger = logging.getLogger("screenmind.workers.analysis_worker")
 
+# Upper bound on backfill_concurrency — mirrors the ceiling in config.py, and
+# also the number of analyzer tasks a batch spawns. They are all spawned up
+# front and gated at runtime, so the setting can move while a batch runs.
+MAX_BACKFILL_CONCURRENCY = 10
+
 # Regex for extracting URLs from OCR/A11y text
 _URL_RE = re.compile(
     r'https?://[^\s<>"\']+'   # Standard http(s) URLs
@@ -131,7 +136,11 @@ class AnalysisWorker:
         # True while a batch analyzes more than one row at a time. Per-item
         # live status is suppressed then: several rows stream into one shared
         # _current dict, which would splice unrelated model output together.
+        # Kept current by _refresh_concurrency, not fixed for the batch.
         self._parallel_backfill = False
+        # Rows currently inside the model stage, compared against the live
+        # concurrency setting to decide whether another may start.
+        self._analyses_in_flight = 0
         # Progress of the scene-description batch (POST /api/timeline/scenes/backfill).
         # Fills in scene_description for analyzed rows that never got one.
         self._scene_backfill_status = {"running": False, "requested": 0,
@@ -887,23 +896,29 @@ class AnalysisWorker:
         the model at once. Leave it at 1 for a single-slot backend
         (llama-server without --parallel) — concurrent requests there just
         queue up, and the per-item progress panel goes quiet for nothing.
+        It is re-read before every row, so changing it in Settings takes
+        effect on the running batch instead of the next one.
 
         Live captures keep priority, but the batch waits for the queue to
         drain and then resumes — the user asked for the whole backlog, and
         dropping it on the first new screenshot would never finish it.
         """
-        concurrency = max(1, min(int(settings.backfill_concurrency), 10))
-        self._parallel_backfill = concurrency > 1
-        # Bounded so prep can't run away: each queued row pins a decoded
-        # screenshot (~6 MB) until an analyzer picks it up.
-        prepared: asyncio.Queue = asyncio.Queue(maxsize=concurrency)
+        self._analyses_in_flight = 0
+        self._refresh_concurrency()
+        # Sized for the ceiling because the setting may rise mid-batch; the
+        # depth actually used is capped against the live value in _prep_loop,
+        # so a low setting still buffers few decoded screenshots (~6 MB each).
+        prepared: asyncio.Queue = asyncio.Queue(maxsize=MAX_BACKFILL_CONCURRENCY)
 
         async def _prep_loop():
-            """CPU stage — feeds analyzers, back-pressured by the queue size."""
+            """CPU stage — feeds analyzers, back-pressured by the live setting."""
             try:
                 for row in rows:
                     if self._backfill_cancel:
                         break
+                    while (not self._backfill_cancel
+                           and prepared.qsize() >= self._refresh_concurrency()):
+                        await asyncio.sleep(0.2)
                     outcome, capture = await self._prepare_backfill_row(row, conn)
                     if capture is None:
                         # Deleted or corrupt screenshot — never reaches the model
@@ -912,36 +927,46 @@ class AnalysisWorker:
                     await prepared.put(capture)
             finally:
                 # Analyzers keep draining after a cancel, so these never block
-                for _ in range(concurrency):
+                for _ in range(MAX_BACKFILL_CONCURRENCY):
                     await prepared.put(None)
 
         async def _analyze_loop():
-            """Model stage — one row at a time, `concurrency` of these run.
+            """Model stage — one row at a time; MAX of these are spawned.
 
-            Never propagates: _prep_loop hands out exactly one sentinel per
+            How many actually run at once is decided per row by
+            _await_analysis_slot, so the setting applies live. Never
+            propagates: _prep_loop hands out exactly one sentinel per
             analyzer, so a worker dying early would leave prep blocked on a
             full queue with nobody left to drain it.
             """
             while True:
-                capture = await prepared.get()
-                if capture is None:
+                # Claim a slot before taking work, so a lowered setting parks
+                # the worker instead of leaving it holding a decoded screenshot.
+                if not await self._await_analysis_slot():
+                    await self._drain_to_sentinel(prepared)
                     return
                 try:
-                    if self._backfill_cancel:
-                        continue  # Drain the rest so _prep_loop can finish
-                    if not await self._await_backfill_slot():
-                        continue
-                    self._record_backfill_result(
-                        await self._analyze_prepared_row(capture, conn)
-                    )
-                except Exception as e:
-                    logger.error(f"Manual backfill row failed: {e}")
-                    self._record_backfill_result("failed")
+                    capture = await prepared.get()
+                    if capture is None:
+                        return
+                    try:
+                        if self._backfill_cancel:
+                            continue  # Drain the rest so _prep_loop can finish
+                        if not await self._await_backfill_slot():
+                            continue
+                        self._record_backfill_result(
+                            await self._analyze_prepared_row(capture, conn)
+                        )
+                    except Exception as e:
+                        logger.error(f"Manual backfill row failed: {e}")
+                        self._record_backfill_result("failed")
+                finally:
+                    self._analyses_in_flight -= 1
 
         try:
             results = await asyncio.gather(
                 _prep_loop(),
-                *[_analyze_loop() for _ in range(concurrency)],
+                *[_analyze_loop() for _ in range(MAX_BACKFILL_CONCURRENCY)],
                 return_exceptions=True,
             )
             for err in [r for r in results if isinstance(r, BaseException)]:
@@ -950,6 +975,7 @@ class AnalysisWorker:
             logger.error(f"Manual backfill aborted: {e}")
         finally:
             self._parallel_backfill = False
+            self._analyses_in_flight = 0
             self._backfill_status["running"] = False
             self._backfill_status["state"] = "cancelled" if self._backfill_cancel else "finished"
             self._backfill_cancel = False
@@ -960,6 +986,37 @@ class AnalysisWorker:
                 f"{self._backfill_status['failed']} failed, {self._backfill_status['skipped']} skipped "
                 f"({self._backfill_status['requested']} requested)"
             )
+
+    def _refresh_concurrency(self) -> int:
+        """Current backfill concurrency, clamped, and sync _parallel_backfill.
+
+        Read fresh on every use rather than once per batch: the setting is what
+        the user reaches for when a batch is already crawling, and making them
+        stop and restart it to apply the change defeats the point.
+        """
+        limit = max(1, min(int(settings.backfill_concurrency), MAX_BACKFILL_CONCURRENCY))
+        self._parallel_backfill = limit > 1
+        return limit
+
+    async def _await_analysis_slot(self) -> bool:
+        """Hold until the live setting has room for another row in the model.
+
+        Returns False when the batch was stopped. On success the slot is
+        already counted — the caller owns decrementing it.
+        """
+        while not self._backfill_cancel:
+            if self._analyses_in_flight < self._refresh_concurrency():
+                self._analyses_in_flight += 1
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
+    @staticmethod
+    async def _drain_to_sentinel(prepared: asyncio.Queue):
+        """Consume this worker's sentinel after a cancel, so prep can finish."""
+        while True:
+            if await prepared.get() is None:
+                return
 
     async def _await_backfill_slot(self) -> bool:
         """Block until no live capture is queued. False if the batch was stopped."""
