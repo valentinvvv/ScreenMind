@@ -39,6 +39,10 @@ class CaptureResult:
     a11y_text: Optional[str] = None  # Pre-captured at screenshot time (correct window)
     phash: Optional[object] = None  # imagehash.ImageHash for per-app cache comparison
     is_backfill: bool = False  # Set for backfilled rows — labels analysis_method
+    # (raw_text, boxes) computed ahead of time by the backfill prefetcher so
+    # OCR of the next row overlaps the LLM call of the current one. None means
+    # "not prefetched" — the analysis worker runs OCR itself.
+    prefetched_ocr: Optional[tuple] = None
 
 
 class CaptureWorker:

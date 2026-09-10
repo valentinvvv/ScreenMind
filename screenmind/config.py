@@ -73,7 +73,7 @@ _ALLOWED_OVERRIDES = {
     "context_window", "kv_cache_quant", "flash_attention",
     "analysis_mode",
     "auto_pause_heavy_apps", "heavy_apps",
-    "defer_analysis", "meeting_transcription",
+    "defer_analysis", "backfill_concurrency", "meeting_transcription",
     "meeting_apps",
     "active_model", "model_variants", "retention_days",
     "gemma_mode", "llm_api_base_url", "llm_api_key", "llm_model_name",
@@ -278,6 +278,16 @@ class Settings(BaseSettings):
     defer_analysis: bool = Field(
         default=False,
         description="When ON, queue screenshots and analyze only when idle (60s no new captures)",
+    )
+    backfill_concurrency: int = Field(
+        default=1,
+        description=(
+            "Rows a backfill batch analyzes in parallel. Only raise this when the "
+            "endpoint serves concurrent requests (vLLM, or llama-server started "
+            "with --parallel N) — a single-slot server just queues them."
+        ),
+        ge=1,
+        le=10,
     )
 
     # ── Meeting Transcription ────────────────────────────────────────────

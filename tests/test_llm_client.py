@@ -57,7 +57,7 @@ class TestInferenceCancellation:
 
     @patch("screenmind.engine.llm_client.httpx.Client")
     def test_active_client_set_during_request(self, mock_client_cls):
-        """_active_client is set during request and cleared after."""
+        """The in-flight client is registered during a request and cleared after."""
         active_during = []
 
         def capture_post(*args, **kwargs):
@@ -71,6 +71,99 @@ class TestInferenceCancellation:
         chat([{"role": "user", "content": "test"}])
         assert active_during[0] is True
         assert is_inference_active() is False
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_cancel_closes_every_in_flight_request(self, mock_client_cls):
+        """A backfill batch can hold several requests — cancel must reach all."""
+        import threading
+
+        from screenmind.engine.llm_client import _active_clients
+
+        clients = [MagicMock() for _ in range(3)]
+        mock_client_cls.side_effect = list(clients)
+        entered = threading.Barrier(4, timeout=5)
+        release = threading.Event()
+        results = []
+
+        def capture_post(*args, **kwargs):
+            entered.wait()  # hold all three open at once
+            release.wait(timeout=5)  # stay registered until cancel has run
+            raise httpx.ConnectError("closed")
+
+        closed = []
+        for c in clients:
+            c.post.side_effect = capture_post
+            c.close.side_effect = lambda c=c: closed.append(c)
+
+        def _call():
+            try:
+                chat([{"role": "user", "content": "test"}])
+            except Exception as e:
+                results.append(type(e).__name__)
+
+        threads = [threading.Thread(target=_call) for _ in clients]
+        for t in threads:
+            t.start()
+        entered.wait()
+        cancel_current_inference()
+        # Every request must be closed by the cancel itself — not later, when
+        # chat() unwinds and closes its own client in `finally`.
+        assert sorted(map(id, closed)) == sorted(map(id, clients))
+        release.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert results == ["InferenceCancelled"] * 3
+        assert not _active_clients
+        _cancel_event.clear()
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_peer_request_does_not_clear_a_pending_cancel(self, mock_client_cls):
+        """Starting a second request must not strand the first one's cancel."""
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+        flag_seen = []
+
+        first = MagicMock()
+        second = MagicMock()
+        mock_client_cls.side_effect = [first, second]
+
+        def first_post(*args, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            flag_seen.append(_cancel_event.is_set())
+            raise httpx.ConnectError("closed")
+
+        def second_post(*args, **kwargs):
+            resp = MagicMock()
+            resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        first.post.side_effect = first_post
+        second.post.side_effect = second_post
+
+        errors = []
+
+        def _call():
+            try:
+                chat([{"role": "user", "content": "one"}])
+            except Exception as e:
+                errors.append(type(e).__name__)
+
+        t = threading.Thread(target=_call)
+        t.start()
+        started.wait(timeout=5)
+        _cancel_event.set()  # cancel aimed at the in-flight request
+        chat([{"role": "user", "content": "two"}])  # a peer starts meanwhile
+        release.set()
+        t.join(timeout=5)
+
+        assert flag_seen == [True]  # the peer left the flag alone
+        assert errors == ["InferenceCancelled"]
+        _cancel_event.clear()
 
 
 class TestChat:
