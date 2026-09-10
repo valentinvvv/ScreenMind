@@ -45,10 +45,13 @@ async def analysis_stream():
     """SSE stream of live analysis progress for the Timeline status panel.
 
     Events:
-      status — full snapshot of the item being processed (stage, day_number,
-               accumulated model response, summary). Sent on connect and on
-               every stage transition.
-      delta  — incremental model output during the analyzing stage.
+      status   — full snapshot of the item being processed (stage, day_number,
+                 accumulated model response, summary). Sent on connect and on
+                 every stage transition.
+      delta    — incremental model output during the analyzing stage.
+      backfill — manual batch progress (requested/analyzed/failed/skipped,
+                 state). Sent on connect while a batch runs, then after
+                 every row.
 
     A keepalive comment goes out every 15s so proxies don't drop the socket.
     """
@@ -63,6 +66,10 @@ async def analysis_stream():
             snapshot = worker.current_status
             if snapshot:
                 yield f"data: {json.dumps({'type': 'status', **snapshot})}\n\n"
+            # Late subscribers (view switch, reconnect) need the batch state
+            batch = worker.backfill_status
+            if batch.get("running"):
+                yield f"data: {json.dumps({'type': 'backfill', **batch})}\n\n"
             while True:
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=15.0)
@@ -249,18 +256,44 @@ async def reanalyze_activity(activity_id: int):
             raise HTTPException(status_code=500, detail=f"Re-analysis failed: {str(e)[:200]}")
 
 
+@router.get("/timeline/unprocessed")
+async def unprocessed_count():
+    """How many activities still owe analysis, plus live batch progress.
+
+    Feeds the dashboard's "Process backlog" button. The count comes from the
+    same predicate the backfill batch selects on, so the number shown is the
+    number a batch would pick up.
+    """
+    from screenmind.api import dependencies as deps
+    result = db.count_unprocessed()
+    result["batch"] = (
+        deps.analysis_worker.backfill_status if deps.analysis_worker else None
+    )
+    return result
+
+
 @router.post("/timeline/backfill")
-async def backfill_timeline(limit: int = Query(default=100, ge=1, le=500)):
+async def backfill_timeline(limit: int = Query(default=100, ge=1, le=5000)):
     """Manually backfill unanalyzed/skipped/failed activities.
 
     Unlike the idle-loop backfill: no 24h window, no cooldown, oldest
     rows first. Starts a background batch and returns immediately —
-    progress is visible via GET /api/status (analysis.backfill).
+    progress is visible via GET /api/status (analysis.backfill) and as
+    `backfill` events on GET /api/analysis/stream.
     """
     from screenmind.api import dependencies as deps
     if deps.analysis_worker is None:
         raise HTTPException(status_code=503, detail="Analysis worker not available")
     return deps.analysis_worker.start_backfill_batch(limit=limit)
+
+
+@router.post("/timeline/backfill/stop")
+async def stop_backfill_timeline():
+    """Stop a running backfill batch after the row it is currently on."""
+    from screenmind.api import dependencies as deps
+    if deps.analysis_worker is None:
+        raise HTTPException(status_code=503, detail="Analysis worker not available")
+    return deps.analysis_worker.stop_backfill_batch()
 
 
 @router.post("/timeline/scenes/backfill")

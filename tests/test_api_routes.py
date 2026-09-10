@@ -477,11 +477,87 @@ class TestBackfillEndpoint:
 
     @pytest.mark.asyncio
     async def test_backfill_limit_validation(self, client):
-        """limit outside 1..500 is rejected."""
+        """limit outside 1..5000 is rejected."""
         resp = await client.post("/api/timeline/backfill?limit=0")
         assert resp.status_code == 422
-        resp = await client.post("/api/timeline/backfill?limit=501")
+        resp = await client.post("/api/timeline/backfill?limit=5001")
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_stop_without_worker_returns_503(self, client):
+        """No analysis worker (test app) → 503."""
+        deps.analysis_worker = None
+        resp = await client.post("/api/timeline/backfill/stop")
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_stop_forwards_to_worker(self, client):
+        """The stop endpoint asks the worker to end the batch."""
+        from unittest.mock import MagicMock
+        worker = MagicMock()
+        worker.stop_backfill_batch.return_value = {"stopped": True, "running": True}
+        deps.analysis_worker = worker
+        try:
+            resp = await client.post("/api/timeline/backfill/stop")
+            assert resp.status_code == 200
+            assert resp.json()["stopped"] is True
+            worker.stop_backfill_batch.assert_called_once_with()
+        finally:
+            deps.analysis_worker = None
+
+
+class TestUnprocessedCountEndpoint:
+    """GET /api/timeline/unprocessed — backlog counter behind the GUI button."""
+
+    @pytest.mark.asyncio
+    async def test_counts_rows_the_backfill_would_pick_up(self, client, db):
+        """Unanalyzed, backlog-skipped and failed rows all count; done rows don't."""
+        base = datetime(2026, 5, 16, 9, 0, 0)
+        db.insert_activity(ScreenshotEntry(
+            timestamp=base, screenshot_path="/tmp/u.jpg", analyzed=False))
+        conn = db._get_conn()
+        for path, summary in (("/tmp/s.jpg", "Skipped (analysis backlog)"),
+                              ("/tmp/f.jpg", "Analysis failed: timeout"),
+                              ("/tmp/ok.jpg", "Reading documentation")):
+            conn.execute(
+                "INSERT INTO activities (timestamp, screenshot_path, analyzed, summary)"
+                " VALUES (?, ?, 1, ?)",
+                (base.isoformat(), path, summary),
+            )
+        conn.commit()
+
+        resp = await client.get("/api/timeline/unprocessed")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 3          # the analyzed, real-summary row is excluded
+        assert data["unanalyzed"] == 1
+        assert data["skipped"] == 1
+        assert data["failed"] == 1
+        assert data["oldest"] is not None
+
+    @pytest.mark.asyncio
+    async def test_reports_batch_progress_when_worker_present(self, client):
+        """The count carries the live batch snapshot so the panel can resume."""
+        from unittest.mock import MagicMock, PropertyMock
+        worker = MagicMock()
+        type(worker).backfill_status = PropertyMock(return_value={
+            "running": True, "requested": 9, "analyzed": 2,
+            "failed": 0, "skipped": 0, "state": "running",
+        })
+        deps.analysis_worker = worker
+        try:
+            resp = await client.get("/api/timeline/unprocessed")
+            assert resp.json()["batch"]["requested"] == 9
+        finally:
+            deps.analysis_worker = None
+
+    @pytest.mark.asyncio
+    async def test_batch_is_null_without_worker(self, client):
+        """No worker → no batch snapshot, but the count still answers."""
+        deps.analysis_worker = None
+        resp = await client.get("/api/timeline/unprocessed")
+        assert resp.status_code == 200
+        assert resp.json()["batch"] is None
 
 
 class TestSceneBackfillEndpoint:

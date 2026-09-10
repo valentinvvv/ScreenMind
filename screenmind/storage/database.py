@@ -17,6 +17,15 @@ from screenmind.storage.models import ActivityRecord, DevContext, ScreenshotEntr
 
 logger = logging.getLogger("screenmind.storage.database")
 
+# Rows the analysis pipeline still owes work on: never analyzed, dropped
+# during a backlog, or failed outright. Single source of truth so the count
+# the dashboard shows matches exactly what a backfill batch picks up.
+UNPROCESSED_WHERE = (
+    "(analyzed = 0"
+    " OR summary = 'Skipped (analysis backlog)'"
+    " OR summary LIKE 'Analysis failed%')"
+)
+
 
 class Database:
     """
@@ -370,6 +379,32 @@ class Database:
             "SELECT COUNT(*) FROM activities WHERE DATE(timestamp) = ?",
             (target_date,),
         ).fetchone()[0]
+
+    def count_unprocessed(self) -> Dict[str, Any]:
+        """Backlog the analysis pipeline still owes work on.
+
+        Mirrors the backfill batch query (no date window), so the number the
+        dashboard shows is the number a batch would pick up.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*),
+                   SUM(analyzed = 0),
+                   SUM(summary = 'Skipped (analysis backlog)'),
+                   SUM(summary LIKE 'Analysis failed%'),
+                   MIN(timestamp)
+            FROM activities
+            WHERE {UNPROCESSED_WHERE}
+            """
+        ).fetchone()
+        return {
+            "count": row[0] or 0,
+            "unanalyzed": row[1] or 0,
+            "skipped": row[2] or 0,
+            "failed": row[3] or 0,
+            "oldest": row[4],
+        }
 
     def get_day_number(self, activity_id: int) -> Optional[int]:
         """Chronological 1-based position of an activity within its day.
