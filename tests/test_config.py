@@ -87,3 +87,36 @@ class TestRuntimeOverrideMerge:
         s, path = self._settings_with_json(tmp_path, {"retention_days": 0})
         s.save_runtime_overrides({"retention_days": 30})
         assert json.loads(path.read_text())["retention_days"] == 30
+
+
+class TestSuiteIsolation:
+    """The suite must not inherit the developer's ~/.screenmind."""
+
+    def test_settings_come_from_defaults_not_the_users_file(self):
+        """CI has no settings.json; a local run must behave identically.
+
+        A locally-passing concurrency test once failed in CI for exactly this
+        reason — the developer's file set backfill_concurrency=4. conftest.py
+        redirects DATA_DIR before screenmind is imported; this asserts it stuck.
+        """
+        from screenmind.config import Settings, settings
+        defaults = Settings.model_fields
+        for key in ("backfill_concurrency", "analysis_mode", "gemma_mode",
+                    "capture_interval", "retention_days"):
+            assert getattr(settings, key) == defaults[key].default, (
+                f"{key} is {getattr(settings, key)!r}, not the default "
+                f"{defaults[key].default!r} — the developer's settings.json leaked "
+                f"into the test run, so this suite and CI disagree."
+            )
+
+    def test_logging_does_not_write_to_the_real_data_dir(self):
+        """Fixture noise must not land in the log used to debug real runs."""
+        import logging
+        import os
+        real = os.path.join(os.path.expanduser("~"), ".screenmind")
+        for h in logging.getLogger("screenmind").handlers:
+            path = getattr(h, "baseFilename", None)
+            if path:
+                assert not os.path.abspath(path).startswith(os.path.abspath(real)), (
+                    f"tests are appending to the production log at {path}"
+                )

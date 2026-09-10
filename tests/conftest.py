@@ -1,13 +1,34 @@
 """Shared pytest fixtures for ScreenMind tests."""
 
+import os
 import tempfile
-from unittest.mock import MagicMock, patch
 
-import pytest
+# Redirect the data directory BEFORE any screenmind import. config.py resolves
+# two things at import time, and both leaked into test runs:
+#   * settings.json — tests read the developer's real ~/.screenmind/settings.json,
+#     so a local run and CI disagreed about every setting the developer had
+#     touched. That is not theoretical: a locally-passing concurrency test failed
+#     in CI purely because the developer's file set backfill_concurrency=4.
+#   * screenmind.log — every run appended its fixture noise ("model exploded",
+#     backfill rows that never existed) to the production log, which is the same
+#     file used to diagnose real runs.
+# DATA_DIR is what pydantic-settings binds to the data_dir field (no env_prefix,
+# case-insensitive); SCREENMIND_DATA_DIR is what _setup_logging reads.
+_TEST_DATA_DIR = os.path.join(tempfile.gettempdir(), "screenmind-tests")
+os.makedirs(_TEST_DATA_DIR, exist_ok=True)
+# A settings.json left by an earlier run would reintroduce exactly the leak
+# this block exists to prevent.
+_stale_overrides = os.path.join(_TEST_DATA_DIR, "settings.json")
+if os.path.exists(_stale_overrides):
+    os.remove(_stale_overrides)
+os.environ.setdefault("DATA_DIR", _TEST_DATA_DIR)
+os.environ.setdefault("SCREENMIND_DATA_DIR", _TEST_DATA_DIR)
 
+from unittest.mock import MagicMock, patch  # noqa: E402
 
+import pytest  # noqa: E402
 
-from screenmind.config import settings
+from screenmind.config import settings  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
