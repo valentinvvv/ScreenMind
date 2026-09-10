@@ -70,8 +70,11 @@
 
 - **Three Analysis Modes** — Accurate (~76s, deep thinking + layout), Balanced (~40s, thinking), or Fast (~12s, no thinking). You choose.
 - **Per-App pHash Cache** — 3-tier caching with app-aware staleness. Communication apps refresh faster than IDEs. Significantly fewer inference calls.
+- **Narrow Quality Gate** — A capture is re-analyzed only when the model returned no summary at all. An `other` category is a real answer, not a gap — gating on it doubled the cost of roughly half of all captures.
 - **Chat-First GPU Priority** — Chat cancels in-flight analysis instantly. GPU freed in <1s.
 - **Parallel Pipeline** — Dev context detection and embedding generation run concurrently (~2-3s savings per frame).
+- **Backlog Prefetch** — A backlog batch decodes and OCRs the next screenshot while the current one is in the model, hiding the CPU stage (~20s/row) behind inference.
+- **Backlog Concurrency** — `backfill_concurrency` (Settings → Capture, 1-10) keeps several rows in the model at once. Worth raising only against a backend that serves parallel requests — vLLM, or llama-server started with `--parallel N`.
 - **Auto-Pause Heavy Apps** — Games, video editors, 3D software detected → capture pauses automatically.
 
 ### 🔒 Privacy & Security

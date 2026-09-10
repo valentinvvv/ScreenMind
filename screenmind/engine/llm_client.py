@@ -87,11 +87,15 @@ class InferenceCancelled(Exception):
 
 
 # ── Cancellation state ──────────────────────────────────────────────────────
-# _cancel_event: set by cancel_current_inference(), cleared at start of chat()
-# _active_client: the httpx.Client for the in-flight request (closed to abort)
-# _client_lock: protects only _active_client reference, never blocks requests
+# _cancel_event: set by cancel_current_inference(), cleared when the last
+#                in-flight request finishes and a new one starts
+# _active_clients: httpx.Clients for the in-flight requests (closed to abort).
+#                  A set, not a single slot: a backfill batch may keep several
+#                  requests in the model at once, and cancelling has to reach
+#                  every one of them.
+# _client_lock: protects only the set, never blocks requests
 _cancel_event = threading.Event()
-_active_client: Optional[httpx.Client] = None
+_active_clients: set = set()
 _client_lock = threading.Lock()
 
 
@@ -108,18 +112,19 @@ def cancel_current_inference():
     """
     _cancel_event.set()
     with _client_lock:
-        if _active_client:
-            try:
-                _active_client.close()
-            except Exception:
-                pass  # Already closed or errored — fine
-    logger.info("Inference cancelled (chat priority)")
+        clients = list(_active_clients)
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass  # Already closed or errored — fine
+    logger.info(f"Inference cancelled (chat priority) — {len(clients)} in flight")
 
 
 def is_inference_active() -> bool:
     """Check if an inference request is currently in-flight."""
     with _client_lock:
-        return _active_client is not None
+        return bool(_active_clients)
 
 
 def _is_custom_backend() -> bool:
@@ -276,11 +281,12 @@ def chat(
     unchanged: the full accumulated assistant text.
     Returns the assistant's response text.
     """
-    global _active_client
-
-    # Clear cancel flag at start of every request — prevents stale cancellation
-    # from a previous cancel_current_inference() call that had nothing to cancel
-    _cancel_event.clear()
+    # Clear the cancel flag only when nothing is in flight — a stale flag from
+    # a cancel that had nothing to cancel must not survive, but clearing it
+    # while a peer request is still running would strand that peer's cancel.
+    with _client_lock:
+        if not _active_clients:
+            _cancel_event.clear()
 
     use_text_model = _route_to_text_model(messages, max_tokens)
     use_vision_model = not use_text_model and _route_to_vision_model(messages)
@@ -360,7 +366,7 @@ def chat(
             )
         client = httpx.Client(timeout=timeout)
         with _client_lock:
-            _active_client = client
+            _active_clients.add(client)
         try:
             if stream_callback is not None and payload.get("stream"):
                 return _stream_chat(client, url, payload, headers, stream_callback)
@@ -385,8 +391,7 @@ def chat(
             raise
         finally:
             with _client_lock:
-                if _active_client is client:
-                    _active_client = None
+                _active_clients.discard(client)
             try:
                 client.close()
             except Exception:
@@ -418,7 +423,7 @@ def _stream_chat(
 ) -> str:
     """Execute a streaming chat completion; returns the accumulated text.
 
-    The caller owns the client lifecycle (registration as _active_client,
+    The caller owns the client lifecycle (registration in _active_clients,
     close, cancellation handling) — this only drives the SSE read loop.
     """
     parts: List[str] = []

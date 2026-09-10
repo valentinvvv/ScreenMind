@@ -56,6 +56,18 @@ def _is_failure_summary(summary: Optional[str]) -> bool:
     return bool(summary) and summary.startswith("Analysis failed")
 
 
+def _missing_quality_fields(record: ActivityRecord) -> list:
+    """Fields whose absence makes an analysis worth re-running.
+
+    Only the summary qualifies. `activity_category` used to be here too, with
+    "other" counted as missing — but _normalize coerces every unrecognized
+    category to "other", so that test flagged a legitimate classification and
+    bought a second full vision call (~60s) that re-ran the identical prompt
+    and returned "other" again. It fired on roughly half of all captures.
+    """
+    return [] if record.activity_summary else ["summary"]
+
+
 def _extract_url(text: str) -> str | None:
     """Extract the most likely active-page URL from OCR/A11y text.
 
@@ -116,6 +128,10 @@ class AnalysisWorker:
                                  "state": "idle"}
         # Set by stop_backfill_batch() — the batch loop checks it between rows.
         self._backfill_cancel = False
+        # True while a batch analyzes more than one row at a time. Per-item
+        # live status is suppressed then: several rows stream into one shared
+        # _current dict, which would splice unrelated model output together.
+        self._parallel_backfill = False
         # Progress of the scene-description batch (POST /api/timeline/scenes/backfill).
         # Fills in scene_description for analyzed rows that never got one.
         self._scene_backfill_status = {"running": False, "requested": 0,
@@ -192,6 +208,11 @@ class AnalysisWorker:
                 pass
 
     def _begin_current(self, activity_id: int, capture: CaptureResult):
+        if capture.is_backfill and self._parallel_backfill:
+            # Clearing _current makes _set_stage/_stream_chunk/_finish_current
+            # no-op for this row; the dashboard shows batch progress instead.
+            self._current = None
+            return
         day_number = None
         try:
             day_number = self._db.get_day_number(activity_id)
@@ -461,9 +482,14 @@ class AnalysisWorker:
             ocr_elapsed = 0.0
             if needs_ocr and self._ocr.is_available:
                 _ocr_start = time.time()
-                ocr_raw, ocr_boxes = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._ocr.extract_text_with_boxes(capture.image)
-                )
+                if capture.prefetched_ocr is not None:
+                    # Backfill prefetcher already ran OCR while the previous
+                    # row was in the model — nothing to wait for here.
+                    ocr_raw, ocr_boxes = capture.prefetched_ocr
+                else:
+                    ocr_raw, ocr_boxes = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self._ocr.extract_text_with_boxes(capture.image)
+                    )
                 ocr_elapsed = time.time() - _ocr_start
                 if ocr_boxes:
                     import json
@@ -582,16 +608,13 @@ class AnalysisWorker:
                 analysis, layout_regions = result
 
                 # ── Quality gate: retry once if critical fields are missing ──
-                # scene_description is NOT a gate criterion: with text-model
-                # routing the text call below (step 3e) generates it from OCR
-                # text. Gating on it made every capture pay for a second full
-                # vision call (~12-40s) that could never fill the field,
-                # halving throughput and growing the queue.
-                _missing = []
-                if not analysis.activity_summary:
-                    _missing.append("summary")
-                if not analysis.activity_category or analysis.activity_category == "other":
-                    _missing.append("category")
+                # Deliberately narrow — see _missing_quality_fields. Neither
+                # scene_description nor an "other" category belongs here: the
+                # first is filled by the text call below (step 3e), the second
+                # is a real answer. Both used to gate, and each bought a second
+                # full vision call (~12-60s) that could not improve on the
+                # first, halving throughput and growing the queue.
+                _missing = _missing_quality_fields(analysis)
 
                 if _missing and not getattr(capture, '_quality_retried', False):
                     capture._quality_retried = True
@@ -601,11 +624,7 @@ class AnalysisWorker:
                     if retry_result:
                         retry_analysis, retry_regions = retry_result
                         # Take retry if it filled more fields
-                        retry_missing = []
-                        if not retry_analysis.activity_summary:
-                            retry_missing.append("summary")
-                        if not retry_analysis.activity_category or retry_analysis.activity_category == "other":
-                            retry_missing.append("category")
+                        retry_missing = _missing_quality_fields(retry_analysis)
                         if len(retry_missing) < len(_missing):
                             analysis, layout_regions = retry_analysis, retry_regions
                             logger.debug(f"Retry filled: {set(_missing) - set(retry_missing)}")
@@ -856,23 +875,81 @@ class AnalysisWorker:
         return {"stopped": True, **self._backfill_status}
 
     async def _run_backfill_batch(self, rows, conn):
-        """Process the batch one row at a time; fresh captures pre-empt.
+        """Run the batch as a prefetch pipeline; fresh captures pre-empt.
+
+        A row costs roughly as much CPU (decode, pHash, OCR) as model time,
+        and the two stages need nothing from each other. So one prep task
+        stays a row ahead of the analyzers: the next screenshot is OCR'd
+        while the current one sits in the model, which hides the CPU stage
+        almost entirely.
+
+        settings.backfill_concurrency additionally keeps that many rows in
+        the model at once. Leave it at 1 for a single-slot backend
+        (llama-server without --parallel) — concurrent requests there just
+        queue up, and the per-item progress panel goes quiet for nothing.
 
         Live captures keep priority, but the batch waits for the queue to
         drain and then resumes — the user asked for the whole backlog, and
         dropping it on the first new screenshot would never finish it.
         """
+        concurrency = max(1, min(int(settings.backfill_concurrency), 10))
+        self._parallel_backfill = concurrency > 1
+        # Bounded so prep can't run away: each queued row pins a decoded
+        # screenshot (~6 MB) until an analyzer picks it up.
+        prepared: asyncio.Queue = asyncio.Queue(maxsize=concurrency)
+
+        async def _prep_loop():
+            """CPU stage — feeds analyzers, back-pressured by the queue size."""
+            try:
+                for row in rows:
+                    if self._backfill_cancel:
+                        break
+                    outcome, capture = await self._prepare_backfill_row(row, conn)
+                    if capture is None:
+                        # Deleted or corrupt screenshot — never reaches the model
+                        self._record_backfill_result(outcome)
+                        continue
+                    await prepared.put(capture)
+            finally:
+                # Analyzers keep draining after a cancel, so these never block
+                for _ in range(concurrency):
+                    await prepared.put(None)
+
+        async def _analyze_loop():
+            """Model stage — one row at a time, `concurrency` of these run.
+
+            Never propagates: _prep_loop hands out exactly one sentinel per
+            analyzer, so a worker dying early would leave prep blocked on a
+            full queue with nobody left to drain it.
+            """
+            while True:
+                capture = await prepared.get()
+                if capture is None:
+                    return
+                try:
+                    if self._backfill_cancel:
+                        continue  # Drain the rest so _prep_loop can finish
+                    if not await self._await_backfill_slot():
+                        continue
+                    self._record_backfill_result(
+                        await self._analyze_prepared_row(capture, conn)
+                    )
+                except Exception as e:
+                    logger.error(f"Manual backfill row failed: {e}")
+                    self._record_backfill_result("failed")
+
         try:
-            for row in rows:
-                if not await self._await_backfill_slot():
-                    break  # Cancelled while running or waiting
-                result = await self._backfill_row(row, conn)
-                key = {"done": "analyzed", "failed": "failed", "skipped": "skipped"}[result]
-                self._backfill_status[key] += 1
-                self._publish_backfill()
+            results = await asyncio.gather(
+                _prep_loop(),
+                *[_analyze_loop() for _ in range(concurrency)],
+                return_exceptions=True,
+            )
+            for err in [r for r in results if isinstance(r, BaseException)]:
+                logger.error(f"Manual backfill stage aborted: {err}")
         except Exception as e:
             logger.error(f"Manual backfill aborted: {e}")
         finally:
+            self._parallel_backfill = False
             self._backfill_status["running"] = False
             self._backfill_status["state"] = "cancelled" if self._backfill_cancel else "finished"
             self._backfill_cancel = False
@@ -932,9 +1009,50 @@ class AnalysisWorker:
         except Exception as e:
             logger.error(f"Backfill error: {e}")
 
+    def _record_backfill_result(self, outcome: str):
+        """Tally one finished row and push the new totals to the dashboard."""
+        key = {"done": "analyzed", "failed": "failed", "skipped": "skipped"}[outcome]
+        self._backfill_status[key] += 1
+        self._publish_backfill()
+
+    def _would_hit_identical_cache(self, capture: CaptureResult) -> bool:
+        """True when _process will reuse a cached result verbatim for this row.
+
+        Mirrors the "identical" tier check in _process, and only decides
+        whether prefetching OCR is worth it — those rows skip OCR entirely,
+        so running it ahead of time would add ~20s to a row that otherwise
+        costs nothing. Being wrong either way is harmless: _process runs OCR
+        itself whenever prefetched_ocr is None.
+        """
+        if not capture.phash or capture.bookmarked:
+            return False
+        key = (capture.app_name or "unknown", (capture.window_title or "")[:100])
+        cached = self._app_cache.get(key)
+        if not cached or _is_failure_summary(cached["analysis"].activity_summary):
+            return False
+        return (capture.phash - cached["phash"]) <= 3
+
     async def _backfill_row(self, row, conn) -> str:
-        """Backfill a single row. Returns 'done', 'failed', or 'skipped'."""
+        """Backfill a single row end to end. Returns 'done'/'failed'/'skipped'.
+
+        The batch pipeline drives the two stages separately so they overlap;
+        this is the sequential path the idle loop uses.
+        """
+        outcome, capture = await self._prepare_backfill_row(row, conn)
+        if capture is None:
+            return outcome
+        return await self._analyze_prepared_row(capture, conn)
+
+    async def _prepare_backfill_row(self, row, conn):
+        """CPU stage: decode the screenshot, pHash it, run OCR.
+
+        Returns (outcome, capture). capture is None when the row is already
+        settled — a deleted or corrupt screenshot never reaches the model.
+        The heavy work goes to an executor: it is pure CPU and would
+        otherwise stall the event loop mid-batch.
+        """
         activity_id, ss_path, window_title, app_name, original_timestamp = row
+        loop = asyncio.get_event_loop()
         try:
             # Check screenshot still exists on disk
             if not ss_path or not Path(ss_path).exists():
@@ -945,14 +1063,19 @@ class AnalysisWorker:
                     (activity_id,),
                 )
                 conn.commit()
-                return "skipped"
+                return "skipped", None
 
             logger.info(f"Backfilling #{activity_id} ({app_name})...")
-            # Load image and create a minimal CaptureResult
-            try:
+
+            def _decode():
                 from screenmind.privacy.encryption import open_image
-                img = open_image(ss_path)
-                img.load()  # Force full decode — catches truncated files
+                import imagehash
+                image = open_image(ss_path)
+                image.load()  # Force full decode — catches truncated files
+                return image, imagehash.phash(image)
+
+            try:
+                img, phash = await loop.run_in_executor(None, _decode)
             except Exception as img_err:
                 # Corrupt/truncated screenshot — mark as permanently failed
                 logger.warning(f"Backfill #{activity_id}: corrupt image, skipping permanently ({img_err})")
@@ -961,10 +1084,7 @@ class AnalysisWorker:
                     (activity_id,),
                 )
                 conn.commit()
-                return "skipped"
-
-            import imagehash
-            phash = imagehash.phash(img)
+                return "skipped", None
 
             # Parse the original timestamp from the database
             try:
@@ -985,6 +1105,28 @@ class AnalysisWorker:
                 is_backfill=True,
             )
 
+            # Backfilled rows carry no a11y text, so _process always needs OCR
+            # unless the cache answers the whole row.
+            if self._ocr.is_available and not self._would_hit_identical_cache(capture):
+                try:
+                    capture.prefetched_ocr = await loop.run_in_executor(
+                        None, lambda: self._ocr.extract_text_with_boxes(img)
+                    )
+                except Exception as e:
+                    # Non-fatal — _process falls back to running OCR itself
+                    logger.debug(f"Backfill #{activity_id}: OCR prefetch failed ({e})")
+
+            return "ready", capture
+
+        except Exception as e:
+            self._backfill_cooldown[activity_id] = time.time()
+            logger.error(f"Backfill #{activity_id} prepare error: {e}")
+            return "failed", None
+
+    async def _analyze_prepared_row(self, capture: CaptureResult, conn) -> str:
+        """Model stage for a prepared row. Returns 'done', 'failed', or 'skipped'."""
+        activity_id = capture.activity_id
+        try:
             await self._process(capture)
 
             # Still a failure placeholder? Back off instead of looping.
@@ -1052,16 +1194,33 @@ class AnalysisWorker:
         ).fetchall()
 
     async def _run_scene_backfill_batch(self, rows):
-        """Generate scenes one row at a time; fresh captures pre-empt."""
-        try:
-            # Pre-load the embedding model once for the whole batch
-            await asyncio.get_event_loop().run_in_executor(None, self._ensure_embedder)
-            for row in rows:
+        """Generate scenes `backfill_concurrency` rows at a time; captures pre-empt.
+
+        Pure text-model work — no screenshot, no vision call — so this is the
+        batch that gains most from a backend serving parallel requests.
+        """
+        concurrency = max(1, min(int(settings.backfill_concurrency), 10))
+        pending = iter(rows)
+        stop = False
+
+        async def _worker():
+            nonlocal stop
+            while not stop:
                 if self._queue.qsize() > 0:
-                    break  # Fresh captures always take priority
+                    stop = True  # Fresh captures always take priority
+                    return
+                try:
+                    row = next(pending)
+                except StopIteration:
+                    return
                 result = await self._scene_backfill_row(row)
                 key = {"done": "generated", "failed": "failed", "skipped": "skipped"}[result]
                 self._scene_backfill_status[key] += 1
+
+        try:
+            # Pre-load the embedding model once for the whole batch
+            await asyncio.get_event_loop().run_in_executor(None, self._ensure_embedder)
+            await asyncio.gather(*[_worker() for _ in range(concurrency)])
         except Exception as e:
             logger.error(f"Scene backfill aborted: {e}")
         finally:

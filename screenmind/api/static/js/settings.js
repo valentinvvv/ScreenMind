@@ -51,6 +51,9 @@ async function renderSettings(el) {
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Deferred Analysis</div><div class="settings-desc">Queue screenshots and analyze only when system is idle</div></div>'
   + _sw('defer-toggle', cfg.defer_analysis) + '</div></div>'
 
+  + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Backlog Concurrency</div><div class="settings-desc">Screenshots a backlog batch sends to the model at once. Raise only if your endpoint serves parallel requests (vLLM, or llama-server with --parallel N) \u2014 a single-slot server just queues them. Above 1 the per-item progress panel is replaced by batch progress.</div></div>'
+  + '<input type="number" id="backfill-concurrency" value="' + (cfg.backfill_concurrency || 1) + '" min="1" max="10" style="width:55px;padding:4px 8px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:var(--text-primary);text-align:center"></div></div>'
+
   + '<div class="settings-card"><div class="settings-card-header"><div><div class="settings-title">Capture Active Monitor <span style="background:var(--accent-primary);color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle">Beta</span></div><div class="settings-desc">Captures the screen with your active window instead of primary monitor. Recommended for multi-monitor setups. Works on Windows, Linux X11, and macOS.</div></div>'
   + _sw('capture-active-monitor', cfg.capture_active_monitor) + '</div></div>'
 
@@ -606,6 +609,7 @@ window.saveSettings = async function() {
     auto_pause_heavy_apps: document.getElementById('auto-pause-toggle').checked,
     heavy_apps: document.getElementById('heavy-apps-input').value,
     defer_analysis: document.getElementById('defer-toggle').checked,
+    backfill_concurrency: parseInt(document.getElementById('backfill-concurrency').value) || 1,
     capture_interval: parseInt(document.getElementById('interval-slider').value),
     capture_active_monitor: document.getElementById('capture-active-monitor').checked,
     meeting_transcription: document.getElementById('meeting-toggle').checked,

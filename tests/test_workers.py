@@ -287,13 +287,33 @@ class TestManualBackfillBatch:
         db._get_conn.return_value = conn
         return AnalysisWorker(queue=asyncio.Queue(), database=db)
 
+    def _stub_stages(self, worker, outcomes=None, prepare=None):
+        """Replace both pipeline stages so no disk, OCR or model is touched.
+
+        Returns the analyze-stage mock; each prepared row carries the id from
+        its source tuple so tests can assert on ordering.
+        """
+        async def _prepare(row, conn):
+            return "ready", CaptureResult(
+                filepath=Path(row[1]), timestamp=datetime.now(),
+                window_title=row[2], app_name=row[3],
+                activity_id=row[0], is_backfill=True,
+            )
+
+        worker._prepare_backfill_row = AsyncMock(side_effect=prepare or _prepare)
+        worker._analyze_prepared_row = AsyncMock(
+            side_effect=outcomes if outcomes is not None else None,
+            return_value="done" if outcomes is None else None,
+        )
+        return worker._analyze_prepared_row
+
     async def test_batch_processes_rows_and_counts(self):
         """Each row's result lands in the right status bucket."""
         rows = [(1, "a.jpg", "t1", "app1", None),
                 (2, "b.jpg", "t2", "app2", None),
                 (3, "c.jpg", "t3", "app3", None)]
         worker = self._worker(rows)
-        worker._backfill_row = AsyncMock(side_effect=["done", "failed", "skipped"])
+        self._stub_stages(worker, outcomes=["done", "failed", "skipped"])
         worker._backfill_status = {"running": True, "requested": 3,
                                    "analyzed": 0, "failed": 0, "skipped": 0}
         await worker._run_backfill_batch(rows, MagicMock())
@@ -301,11 +321,95 @@ class TestManualBackfillBatch:
         assert status["running"] is False
         assert (status["analyzed"], status["failed"], status["skipped"]) == (1, 1, 1)
 
+    async def test_settled_rows_never_reach_the_model(self):
+        """A deleted/corrupt screenshot is counted by prepare, not analyzed."""
+        rows = [(1, "gone.jpg", "t", "app", None)]
+        worker = self._worker(rows)
+
+        async def _prepare(row, conn):
+            return "skipped", None
+
+        analyze = self._stub_stages(worker, prepare=_prepare)
+        worker._backfill_status = {"running": True, "requested": 1,
+                                   "analyzed": 0, "failed": 0, "skipped": 0,
+                                   "state": "running"}
+        await worker._run_backfill_batch(rows, MagicMock())
+        analyze.assert_not_awaited()
+        assert worker.backfill_status["skipped"] == 1
+
+    async def test_prepare_runs_ahead_of_analyze(self):
+        """The next row is prepared while the current one is in the model."""
+        rows = [(1, "a.jpg", "t", "app", None), (2, "b.jpg", "t", "app", None)]
+        worker = self._worker(rows)
+        worker._backfill_status = {"running": True, "requested": 2,
+                                   "analyzed": 0, "failed": 0, "skipped": 0,
+                                   "state": "running"}
+        prepared = []
+        release = asyncio.Event()
+
+        async def _prepare(row, conn):
+            prepared.append(row[0])
+            return "ready", CaptureResult(
+                filepath=Path(row[1]), timestamp=datetime.now(),
+                activity_id=row[0], is_backfill=True,
+            )
+
+        async def _analyze(capture, conn):
+            if capture.activity_id == 1:
+                await release.wait()  # row 1 sits in the model
+            return "done"
+
+        worker._prepare_backfill_row = AsyncMock(side_effect=_prepare)
+        worker._analyze_prepared_row = AsyncMock(side_effect=_analyze)
+        task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # Row 2's CPU stage finished without waiting for row 1's model call
+        assert prepared == [1, 2]
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+        assert worker.backfill_status["analyzed"] == 2
+
+    async def test_concurrency_keeps_several_rows_in_the_model(self):
+        """backfill_concurrency > 1 analyzes that many rows at once."""
+        from screenmind.config import settings
+
+        rows = [(i, f"{i}.jpg", "t", "app", None) for i in range(1, 4)]
+        worker = self._worker(rows)
+        worker._backfill_status = {"running": True, "requested": 3,
+                                   "analyzed": 0, "failed": 0, "skipped": 0,
+                                   "state": "running"}
+        self._stub_stages(worker)
+        in_flight = 0
+        peak = 0
+        release = asyncio.Event()
+
+        async def _analyze(capture, conn):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await release.wait()
+            in_flight -= 1
+            return "done"
+
+        worker._analyze_prepared_row = AsyncMock(side_effect=_analyze)
+        with patch.object(settings, "backfill_concurrency", 3):
+            task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert peak == 3
+            release.set()
+            await asyncio.wait_for(task, timeout=5)
+        assert worker.backfill_status["analyzed"] == 3
+        # Per-item status is suppressed only for the duration of the batch
+        assert worker._parallel_backfill is False
+
     async def test_batch_waits_for_fresh_capture_then_resumes(self):
         """A queued live capture parks the batch; it resumes once drained."""
         rows = [(1, "a.jpg", "t", "app", None)]
         worker = self._worker(rows)
-        worker._backfill_row = AsyncMock(return_value="done")
+        analyze = self._stub_stages(worker, outcomes=["done"])
         worker._backfill_status = {"running": True, "requested": 1,
                                    "analyzed": 0, "failed": 0, "skipped": 0,
                                    "state": "running"}
@@ -313,17 +417,17 @@ class TestManualBackfillBatch:
         task = asyncio.create_task(worker._run_backfill_batch(rows, MagicMock()))
         for _ in range(5):
             await asyncio.sleep(0)
-        worker._backfill_row.assert_not_awaited()
+        analyze.assert_not_awaited()
         assert worker.backfill_status["state"] == "waiting"
 
         worker._queue.get_nowait()  # main loop drained the live capture
         await asyncio.wait_for(task, timeout=5)
-        worker._backfill_row.assert_awaited_once()
+        analyze.assert_awaited_once()
         assert worker.backfill_status["analyzed"] == 1
         assert worker.backfill_status["state"] == "finished"
 
     async def test_batch_stops_when_cancelled(self):
-        """stop_backfill_batch ends the run without touching more rows."""
+        """stop_backfill_batch ends the run without analyzing more rows."""
         rows = [(1, "a.jpg", "t", "app", None), (2, "b.jpg", "t", "app", None)]
         worker = self._worker(rows)
         worker._backfill_status = {"running": True, "requested": 2,
@@ -334,9 +438,12 @@ class TestManualBackfillBatch:
             worker.stop_backfill_batch()  # user hit Stop mid-row
             return "done"
 
-        worker._backfill_row = AsyncMock(side_effect=_row)
-        await worker._run_backfill_batch(rows, MagicMock())
-        assert worker._backfill_row.await_count == 1
+        analyze = self._stub_stages(worker)
+        worker._analyze_prepared_row = AsyncMock(side_effect=_row)
+        await asyncio.wait_for(
+            worker._run_backfill_batch(rows, MagicMock()), timeout=5
+        )
+        assert worker._analyze_prepared_row.await_count == 1
         assert worker.backfill_status["state"] == "cancelled"
         assert worker.backfill_status["running"] is False
 
@@ -345,13 +452,35 @@ class TestManualBackfillBatch:
         worker = self._worker([])
         assert worker.stop_backfill_batch()["stopped"] is False
 
+    async def test_crashing_row_does_not_stall_the_batch(self):
+        """A worker that blows up must not strand the prefetcher."""
+        rows = [(i, f"{i}.jpg", "t", "app", None) for i in range(1, 4)]
+        worker = self._worker(rows)
+        worker._backfill_status = {"running": True, "requested": 3,
+                                   "analyzed": 0, "failed": 0, "skipped": 0,
+                                   "state": "running"}
+        self._stub_stages(worker)
+
+        async def _analyze(capture, conn):
+            if capture.activity_id == 1:
+                raise RuntimeError("model exploded")
+            return "done"
+
+        worker._analyze_prepared_row = AsyncMock(side_effect=_analyze)
+        await asyncio.wait_for(
+            worker._run_backfill_batch(rows, MagicMock()), timeout=5
+        )
+        status = worker.backfill_status
+        assert (status["analyzed"], status["failed"]) == (2, 1)
+        assert status["state"] == "finished"
+
     async def test_batch_publishes_progress(self):
         """Each finished row broadcasts a backfill event to SSE subscribers."""
         rows = [(1, "a.jpg", "t", "app", None)]
         worker = self._worker(rows)
         worker._loop = asyncio.get_event_loop()
         q = worker.subscribe()
-        worker._backfill_row = AsyncMock(return_value="done")
+        self._stub_stages(worker, outcomes=["done"])
         worker._backfill_status = {"running": True, "requested": 1,
                                    "analyzed": 0, "failed": 0, "skipped": 0,
                                    "state": "running"}
@@ -383,16 +512,16 @@ class TestManualBackfillBatch:
         """start_backfill_batch returns immediately; the task drains the rows."""
         rows = [(1, "a.jpg", "t", "app", None)]
         worker = self._worker(rows)
-        worker._backfill_row = AsyncMock(return_value="done")
+        analyze = self._stub_stages(worker, outcomes=["done"])
         result = worker.start_backfill_batch(limit=10)
         assert result["running"] is True
         assert result["requested"] == 1
-        for _ in range(10):
+        for _ in range(20):
             await asyncio.sleep(0)
             if not worker.backfill_running():
                 break
         assert worker.backfill_status["analyzed"] == 1
-        worker._backfill_row.assert_awaited_once()
+        analyze.assert_awaited_once()
 
     async def test_idle_loop_stands_down_during_batch(self):
         """The 2s idle backfill doesn't race the manual batch."""
@@ -401,6 +530,152 @@ class TestManualBackfillBatch:
         worker._backfill_one = AsyncMock()
         await worker._backfill_skipped()
         worker._backfill_one.assert_not_awaited()
+
+
+class TestQualityGate:
+    """The one-shot re-analysis gate — what counts as worth a second call."""
+
+    def _record(self, summary="Reviewing a pull request", category="coding"):
+        from screenmind.storage.models import ActivityRecord
+        return ActivityRecord(
+            app_name="app", activity_category=category,
+            activity_summary=summary, confidence=0.9,
+        )
+
+    def test_other_category_is_a_real_answer(self):
+        """'other' must not trigger a retry — _normalize coerces into it."""
+        from screenmind.workers.analysis_worker import _missing_quality_fields
+        assert _missing_quality_fields(self._record(category="other")) == []
+
+    def test_empty_summary_is_worth_a_retry(self):
+        from screenmind.workers.analysis_worker import _missing_quality_fields
+        assert _missing_quality_fields(self._record(summary="")) == ["summary"]
+
+    def test_complete_record_needs_nothing(self):
+        from screenmind.workers.analysis_worker import _missing_quality_fields
+        assert _missing_quality_fields(self._record()) == []
+
+    def _worker_for_process(self):
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        w = AnalysisWorker(queue=asyncio.Queue(), database=MagicMock())
+        w._ocr = MagicMock()
+        w._ocr.is_available = False
+        w._analyzer = MagicMock()
+        w._analyzer.generate_scene_from_text.return_value = None
+        w._embedder = None
+        w._embedder_available = False
+        w._dev_context = MagicMock()
+        w._dev_context.is_coding_activity.return_value = False
+        return w
+
+    def _capture(self):
+        return CaptureResult(
+            filepath=Path(__file__), timestamp=datetime.now(),
+            window_title="t", app_name="app", activity_id=11,
+            image=MagicMock(), is_backfill=True,
+        )
+
+    async def _run(self, record):
+        from screenmind.config import settings
+        worker = self._worker_for_process()
+        worker._analyzer.analyze_screenshot_fast.return_value = (record, [])
+        with patch.object(settings, "analysis_mode", "fast"), \
+             patch.object(settings, "auto_bookmark", False):
+            await worker._process(self._capture())
+        return worker._analyzer.analyze_screenshot_fast.call_count
+
+    async def test_other_category_costs_one_vision_call(self):
+        """The regression this gate caused: 'other' doubled ~half of all rows."""
+        assert await self._run(self._record(category="other")) == 1
+
+    async def test_empty_summary_costs_two_vision_calls(self):
+        """A genuinely empty analysis is still retried once."""
+        assert await self._run(self._record(summary="")) == 2
+
+
+class TestBackfillPrefetch:
+    """The CPU stage that runs ahead of the model — decode, pHash, OCR."""
+
+    def _worker(self):
+        from screenmind.workers.analysis_worker import AnalysisWorker
+        return AnalysisWorker(queue=asyncio.Queue(), database=MagicMock())
+
+    def _cached(self, worker, phash, summary="Reviewing a pull request"):
+        from screenmind.storage.models import ActivityRecord
+        worker._app_cache[("app", "title")] = {
+            "phash": phash,
+            "analysis": ActivityRecord(
+                app_name="app", activity_category="coding",
+                activity_summary=summary, confidence=0.9,
+            ),
+        }
+
+    def _capture(self, phash, bookmarked=False):
+        return CaptureResult(
+            filepath=Path("a.jpg"), timestamp=datetime.now(),
+            window_title="title", app_name="app",
+            bookmarked=bookmarked, phash=phash, is_backfill=True,
+        )
+
+    def test_identical_screen_skips_ocr_prefetch(self):
+        """Cache hits reuse everything, so prefetching OCR is wasted work."""
+        import imagehash
+        worker = self._worker()
+        phash = imagehash.hex_to_hash("f0f0f0f0f0f0f0f0")
+        self._cached(worker, phash)
+        assert worker._would_hit_identical_cache(self._capture(phash)) is True
+
+    def test_changed_screen_prefetches_ocr(self):
+        """A different screen runs the full pipeline — OCR is worth prefetching."""
+        import imagehash
+        worker = self._worker()
+        self._cached(worker, imagehash.hex_to_hash("0000000000000000"))
+        assert worker._would_hit_identical_cache(
+            self._capture(imagehash.hex_to_hash("ffffffffffffffff"))
+        ) is False
+
+    def test_cached_failure_never_counts_as_identical(self):
+        """A cached failure placeholder must not suppress real work."""
+        import imagehash
+        worker = self._worker()
+        phash = imagehash.hex_to_hash("f0f0f0f0f0f0f0f0")
+        self._cached(worker, phash, summary="Analysis failed: boom")
+        assert worker._would_hit_identical_cache(self._capture(phash)) is False
+
+    def test_bookmarked_row_always_prefetches(self):
+        """Bookmarks bypass the cache in _process, so they need OCR."""
+        import imagehash
+        worker = self._worker()
+        phash = imagehash.hex_to_hash("f0f0f0f0f0f0f0f0")
+        self._cached(worker, phash)
+        assert worker._would_hit_identical_cache(
+            self._capture(phash, bookmarked=True)
+        ) is False
+
+    def test_no_phash_prefetches(self):
+        """Without a pHash there is nothing to compare — run OCR."""
+        worker = self._worker()
+        assert worker._would_hit_identical_cache(self._capture(None)) is False
+
+    async def test_process_uses_prefetched_ocr(self):
+        """_process consumes the prefetched result instead of re-running OCR."""
+        worker = self._worker()
+        worker._ocr = MagicMock()
+        worker._ocr.is_available = True
+        worker._ocr.extract_text_with_boxes = MagicMock()
+        worker._db.get_activity_by_id = MagicMock(return_value=None)
+
+        capture = CaptureResult(
+            filepath=Path(__file__), timestamp=datetime.now(),
+            window_title="t", app_name="app", activity_id=7,
+            image=MagicMock(), is_backfill=True,
+            prefetched_ocr=("prefetched screen text", [{"text": "hi"}]),
+        )
+        worker._analyzer = MagicMock()
+        worker._analyzer.analyze_screenshot_fast.side_effect = RuntimeError("stop here")
+        await worker._process(capture)
+        # The executor OCR path was never taken
+        worker._ocr.extract_text_with_boxes.assert_not_called()
 
 class TestFailureSummaryHelper:
     """Tests for _is_failure_summary — guards cache writes and backfill."""
