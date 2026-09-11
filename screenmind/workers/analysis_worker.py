@@ -28,7 +28,7 @@ from typing import Optional
 from PIL import Image
 
 from screenmind.config import settings
-from screenmind.engine.analyzer import GemmaAnalyzer
+from screenmind.engine.analyzer import GemmaAnalyzer, UNPARSED_SUMMARY
 from screenmind.engine.dev_context import DevContextDetector
 from screenmind.engine.embedder import Embedder
 from screenmind.engine.llm_client import InferenceCancelled
@@ -70,7 +70,13 @@ def _missing_quality_fields(record: ActivityRecord) -> list:
     bought a second full vision call (~60s) that re-ran the identical prompt
     and returned "other" again. It fired on roughly half of all captures.
     """
-    return [] if record.activity_summary else ["summary"]
+    summary = (record.activity_summary or "").strip()
+    if not summary or summary == UNPARSED_SUMMARY:
+        # The salvage marker is not content — a row carrying it is exactly
+        # the case a retry exists for, and without this it was stored as if
+        # the analysis had succeeded.
+        return ["summary"]
+    return []
 
 
 def _extract_url(text: str) -> str | None:

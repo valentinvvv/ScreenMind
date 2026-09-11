@@ -1,8 +1,11 @@
 """Tests for engine/analyzer.py — response parsing logic (no Ollama needed)."""
 
+import json
 from unittest.mock import patch
 
-from screenmind.engine.analyzer import GemmaAnalyzer, is_remote_session
+from screenmind.engine.analyzer import (
+    GemmaAnalyzer, UNPARSED_SUMMARY, is_remote_session,
+)
 
 
 def test_parse_clean_json():
@@ -199,3 +202,163 @@ class TestSceneFromTextRemoteSession:
         prompt = mock_llm.chat.call_args.kwargs["messages"][0]["content"]
         assert "plain inventory of everything visible" in prompt
         assert "REMOTE-DESKTOP" not in prompt
+
+
+# Shapes taken from real merged-mode responses, with the screen content
+# replaced. The failing one is what the model emits when it loops inside
+# visible_text_snippets until max_tokens cuts it off: fenced, nested two
+# levels deep, and stopping mid-array with no closing fence.
+_TRUNCATED = """```json
+{
+  "layout": [
+    {
+      "name": "main_content",
+      "x_start": 0.0,
+      "x_end": 0.75,
+      "y_start": 0.0,
+      "y_end": 0.96,
+      "content_type": "code"
+    },
+    {
+      "name": "toolbars",
+      "x_start": 0.0,
+      "x_end": 1.0,
+      "y_start": 0.0,
+      "y_end": 0.05,
+      "content_type": "toolbar"
+    }
+  ],
+  "analysis": {
+    "app_name": "Terminal",
+    "activity_category": "terminal",
+    "activity_summary": "The user is running a deployment script.",
+    "detailed_context": "A shell session is executing a deploy.",
+    "visible_text_snippets": [
+      "status error read tcp",
+      "status error read tcp",
+      "status error read tcp",
+      "status error"""
+
+_COMPLETE = """```json
+{
+  "layout": [
+    {
+      "name": "main_content",
+      "x_start": 0.0,
+      "x_end": 1.0,
+      "y_start": 0.0,
+      "y_end": 1.0,
+      "content_type": "code"
+    }
+  ],
+  "analysis": {
+    "app_name": "Terminal",
+    "activity_category": "terminal",
+    "activity_summary": "The user is running a deployment script.",
+    "detailed_context": "A shell session is executing a deploy.",
+    "visible_text_snippets": ["deploy.sh"],
+    "mood": "productive",
+    "confidence": 0.9,
+    "scene_description": "A terminal window fills the screen."
+  }
+}
+```"""
+
+
+class TestExtractJson:
+    """Extraction must not hand back a valid-but-wrong fragment."""
+
+    def setup_method(self):
+        self.a = GemmaAnalyzer()
+
+    def test_complete_response_yields_the_whole_object(self):
+        body = self.a._extract_json(_COMPLETE)
+        assert body is not None
+        data = json.loads(body)
+        assert set(data) == {"layout", "analysis"}
+
+    def test_truncated_response_yields_nothing(self):
+        """The bug: this used to return the first layout region.
+
+        ~150 chars of valid JSON with no analysis in it, which callers then
+        accepted as a successful parse and turned into an empty record.
+        """
+        assert self.a._extract_json(_TRUNCATED) is None
+
+    def test_braces_inside_strings_do_not_close_the_object(self):
+        raw = '{"activity_summary": "user typed a { brace", "confidence": 0.9}'
+        data = json.loads(self.a._extract_json(raw))
+        assert data["activity_summary"] == "user typed a { brace"
+
+    def test_escaped_quote_inside_a_string_is_not_a_terminator(self):
+        raw = r'{"activity_summary": "he said \"hi\" then {", "confidence": 0.5}'
+        data = json.loads(self.a._extract_json(raw))
+        assert data["confidence"] == 0.5
+
+    def test_prose_before_the_object_is_skipped(self):
+        raw = 'Here is the analysis you asked for:\n{"activity_summary": "coding"}'
+        assert json.loads(self.a._extract_json(raw))["activity_summary"] == "coding"
+
+    def test_no_object_at_all(self):
+        assert self.a._extract_json("I cannot analyze this image.") is None
+
+
+class TestMergedParseRecovery:
+    """A truncated response still carries the analysis — recover it."""
+
+    def setup_method(self):
+        self.a = GemmaAnalyzer()
+
+    def test_truncated_response_recovers_the_summary(self):
+        record, regions = self.a._parse_merged_response(_TRUNCATED, "Terminal", "bash")
+        assert record.activity_summary == "The user is running a deployment script."
+        assert record.activity_category == "terminal"
+        assert regions == []          # layout was in the part that got cut
+
+    def test_complete_response_is_unaffected(self):
+        record, regions = self.a._parse_merged_response(_COMPLETE, "Terminal", "bash")
+        assert record.activity_summary == "The user is running a deployment script."
+        assert len(regions) == 1
+
+    def test_a_balanced_but_wrong_object_is_not_mistaken_for_analysis(self):
+        """Defence in depth: ActivityRecord(**x) ignores unknown keys.
+
+        A stray object — a layout region, say — must not be accepted as the
+        analysis payload. There is nothing to recover from this text, so an
+        empty record is the honest outcome (the worker's quality gate then
+        retries); what matters is that no region field leaks in and no
+        content is invented.
+        """
+        raw = ('{"name": "main_content", "x_start": 0.0, "x_end": 0.75, '
+               '"y_start": 0.0, "y_end": 0.96, "content_type": "code"}')
+        record, regions = self.a._parse_merged_response(raw, "Terminal", "bash")
+        # Nothing in this text is recoverable, so the salvage marker is the
+        # honest answer. The worker's quality gate treats it as a missing
+        # summary and retries — see test_unparsed_marker_counts_as_missing.
+        assert record.activity_summary == UNPARSED_SUMMARY
+        assert record.detailed_context == ""
+        assert regions == []
+        assert record.app_name == "Terminal"      # from the hint, not the object
+
+    def test_stray_object_before_the_analysis_does_not_win(self):
+        """Extraction takes the first balanced object — which may be junk.
+
+        Here a coordinate blob precedes the real payload. Without the
+        structural check that blob is accepted and the analysis below it is
+        never looked at; with it, the regex fallback still finds the summary.
+        """
+        raw = (
+            'Detected regions: {"x_start": 0.0, "y_start": 0.0}\n'
+            'Analysis:\n'
+            '{"app_name": "Terminal", "activity_category": "terminal", '
+            '"activity_summary": "The user is tailing a log file."}'
+        )
+        record, _regions = self.a._parse_merged_response(raw, "Terminal", "bash")
+        assert record.activity_summary == "The user is tailing a log file."
+
+    def test_looks_like_analysis(self):
+        from screenmind.engine.analyzer import _looks_like_analysis
+        assert _looks_like_analysis({"activity_summary": "x"}) is True
+        assert _looks_like_analysis({"confidence": 0.5}) is True
+        assert _looks_like_analysis({"name": "main_content", "x_start": 0.0}) is False
+        assert _looks_like_analysis([]) is False
