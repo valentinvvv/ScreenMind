@@ -603,6 +603,20 @@ class TestQualityGate:
         from screenmind.workers.analysis_worker import _missing_quality_fields
         assert _missing_quality_fields(self._record(summary="")) == ["summary"]
 
+    def test_unparsed_marker_counts_as_missing(self):
+        """The salvage marker is not content — the row deserves a retry.
+
+        38 rows were already stored carrying it, because a non-empty string
+        looked like a successful analysis to the gate.
+        """
+        from screenmind.engine.analyzer import UNPARSED_SUMMARY
+        from screenmind.workers.analysis_worker import _missing_quality_fields
+        assert _missing_quality_fields(self._record(summary=UNPARSED_SUMMARY)) == ["summary"]
+
+    def test_whitespace_only_summary_counts_as_missing(self):
+        from screenmind.workers.analysis_worker import _missing_quality_fields
+        assert _missing_quality_fields(self._record(summary="   ")) == ["summary"]
+
     def test_complete_record_needs_nothing(self):
         from screenmind.workers.analysis_worker import _missing_quality_fields
         assert _missing_quality_fields(self._record()) == []

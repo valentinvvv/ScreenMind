@@ -52,6 +52,26 @@ _REMOTE_SESSION_RE = re.compile(
 )
 
 
+# Any one of these marks an object as the analysis payload. A balanced JSON
+# object carrying none of them is something else entirely — a layout region,
+# say — and must not be accepted as a parsed analysis.
+_ANALYSIS_KEYS = frozenset({
+    "app_name", "activity_category", "activity_summary", "detailed_context",
+    "visible_text_snippets", "mood", "confidence", "scene_description",
+})
+
+
+# What _regex_fallback writes when it salvages nothing. Not content: the
+# worker's quality gate treats it as a missing summary so the row is retried
+# instead of storing the marker (38 rows already carry it).
+UNPARSED_SUMMARY = "Unable to parse response"
+
+
+def _looks_like_analysis(data) -> bool:
+    """True when a decoded JSON object carries at least one analysis field."""
+    return isinstance(data, dict) and bool(_ANALYSIS_KEYS & set(data))
+
+
 def is_remote_session(app_name: Optional[str], window_title: Optional[str]) -> bool:
     """True when the capture shows a remote-desktop client window."""
     return bool(_REMOTE_SESSION_RE.search(f"{app_name or ''} {window_title or ''}"))
@@ -553,7 +573,7 @@ class GemmaAnalyzer:
                 record = self._parse_response(raw_response, app_name_hint, window_title)
 
                 # If regex fallback produced the failure placeholder, retry inference
-                if record.activity_summary == "Unable to parse response" and attempt == 0:
+                if record.activity_summary == UNPARSED_SUMMARY and attempt == 0:
                     logger.warning("Balanced parse failed, retrying inference...")
                     continue
 
@@ -678,7 +698,8 @@ class GemmaAnalyzer:
             # Step 1: Direct parse
             try:
                 data = json.loads(json_str)
-                return ActivityRecord(**data)
+                if _looks_like_analysis(data):
+                    return ActivityRecord(**data)
             except json.JSONDecodeError:
                 pass
             except Exception:
@@ -689,14 +710,15 @@ class GemmaAnalyzer:
             if repaired:
                 try:
                     data = json.loads(repaired)
-                    logger.debug("JSON repaired successfully")
-                    return ActivityRecord(**data)
+                    if _looks_like_analysis(data):
+                        logger.debug("JSON repaired successfully")
+                        return ActivityRecord(**data)
                 except Exception:
                     pass
 
         # Step 3: Regex fallback — extract fields individually
         fallback = self._regex_fallback(raw)
-        if fallback.activity_summary != "Unable to parse response":
+        if fallback.activity_summary != UNPARSED_SUMMARY:
             logger.debug("Used regex fallback")
             return fallback
 
@@ -760,6 +782,11 @@ class GemmaAnalyzer:
                     analysis_data = data.get("analysis", data)
                     if "layout" in analysis_data:
                         analysis_data = {k: v for k, v in analysis_data.items() if k != "layout"}
+                    if not _looks_like_analysis(analysis_data):
+                        # ActivityRecord(**x) ignores unknown keys, so without
+                        # this a wrong object parses into an all-defaults record
+                        # and looks like success. Raise to reach the fallbacks.
+                        raise ValueError("JSON object carries no analysis fields")
                     record = ActivityRecord(**analysis_data)
                     record = self._normalize(record, app_name_hint, window_title)
                     return record, valid_regions
@@ -781,6 +808,8 @@ class GemmaAnalyzer:
                             analysis_data = data.get("analysis", data)
                             if "layout" in analysis_data:
                                 analysis_data = {k: v for k, v in analysis_data.items() if k != "layout"}
+                            if not _looks_like_analysis(analysis_data):
+                                raise ValueError("repaired JSON carries no analysis fields")
                             record = ActivityRecord(**analysis_data)
                             logger.debug("JSON repaired successfully (merged)")
                             return self._normalize(record, app_name_hint, window_title), valid_regions
@@ -823,6 +852,8 @@ class GemmaAnalyzer:
         if json_str:
             try:
                 data = json.loads(json_str)
+                if not _looks_like_analysis(data):
+                    raise ValueError("JSON object carries no analysis fields")
                 record = ActivityRecord(**data)
                 return self._normalize(record, app_name_hint, window_title)
             except (json.JSONDecodeError, Exception) as e:
@@ -833,9 +864,10 @@ class GemmaAnalyzer:
             if repaired:
                 try:
                     data = json.loads(repaired)
-                    logger.debug("JSON repaired successfully (balanced mode)")
-                    record = ActivityRecord(**data)
-                    return self._normalize(record, app_name_hint, window_title)
+                    if _looks_like_analysis(data):
+                        logger.debug("JSON repaired successfully (balanced mode)")
+                        record = ActivityRecord(**data)
+                        return self._normalize(record, app_name_hint, window_title)
                 except Exception:
                     pass
 
@@ -987,29 +1019,54 @@ class GemmaAnalyzer:
         except json.JSONDecodeError:
             return None
 
-    def _extract_json(self, text: str) -> Optional[str]:
-        """Extract a JSON object from text, handling various wrapper formats."""
-        # 1. Try: text is already clean JSON
-        text = text.strip()
-        if text.startswith("{") and text.endswith("}"):
-            return text
+    @staticmethod
+    def _balanced_object(text: str, start: int) -> Optional[str]:
+        """The complete {...} beginning at `start`, or None if it never closes.
 
-        # 2. Try: JSON in markdown code block
-        code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if code_block_match:
-            return code_block_match.group(1)
-
-        # 3. Try: find the first { ... } block in the text
-        brace_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-        if brace_match:
-            return brace_match.group(0)
-
-        # 4. Try: find JSON array-containing object
-        deep_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if deep_match:
-            return deep_match.group(0)
-
+        String-aware: braces inside a JSON string value must not move the
+        depth, or a summary that mentions "{" would end the object early.
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
         return None
+
+    def _extract_json(self, text: str) -> Optional[str]:
+        """Extract the outermost JSON object from a model response.
+
+        Returns None when no object closes — and that is the point. The old
+        regexes understood only one level of nesting, so on a response the
+        model had truncated mid-array (it looped until it hit max_tokens,
+        leaving no closing fence) they matched the first *layout region*:
+        ~150 characters of perfectly valid JSON containing none of the
+        analysis. Callers treated that as a successful parse and returned an
+        empty record, so _repair_json and _regex_fallback never ran — even
+        though the summary was still sitting in the raw text and the regex
+        fallback recovers it. Failing here is what lets them run.
+        """
+        text = text.strip()
+        start = text.find("{")
+        if start == -1:
+            return None
+        return self._balanced_object(text, start)
 
     def _regex_fallback(self, text: str) -> ActivityRecord:
         """
@@ -1027,7 +1084,7 @@ class GemmaAnalyzer:
                 r'"?activity_category"?\s*[:=]\s*"([^"]+)"', "other"
             ),
             activity_summary=extract_field(
-                r'"?activity_summary"?\s*[:=]\s*"([^"]+)"', "Unable to parse response"
+                r'"?activity_summary"?\s*[:=]\s*"([^"]+)"', UNPARSED_SUMMARY
             ),
             detailed_context=extract_field(
                 r'"?detailed_context"?\s*[:=]\s*"([^"]+)"', ""
